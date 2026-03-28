@@ -15,7 +15,12 @@ enum class PaymentIntentStatus {
 }
 
 @Entity
-@Table(name = "payment_intents")
+@Table(
+    name = "payment_intents",
+    indexes = [
+        Index(name = "idx_pi_status_updated", columnList = "status, updatedAt")
+    ]
+)
 data class PaymentIntent(
     @Id
     val id: String = UUID.randomUUID().toString(),

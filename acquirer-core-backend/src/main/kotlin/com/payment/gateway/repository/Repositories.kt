@@ -29,6 +29,8 @@ interface PaymentAttemptRepository : JpaRepository<PaymentAttempt, String> {
 interface InternalAttemptRepository : JpaRepository<InternalAttempt, String> {
     fun findByPaymentAttemptId(paymentAttemptId: String): List<InternalAttempt>
 
+    fun findByPaymentAttemptIdIn(paymentAttemptIds: List<String>): List<InternalAttempt>
+
     @Query("""
         SELECT ia FROM InternalAttempt ia
         WHERE ia.type = :type
@@ -43,8 +45,9 @@ interface InternalAttemptRepository : JpaRepository<InternalAttempt, String> {
           AND ia.status = 'PENDING'
           AND ia.createdAt < :before
         ORDER BY ia.createdAt ASC
+        LIMIT :limit
     """)
-    fun findUndispatched(before: Instant): List<InternalAttempt>
+    fun findUndispatched(before: Instant, limit: Int = 50): List<InternalAttempt>
 }
 
 @Repository

@@ -23,9 +23,9 @@ interface LedgerEntryRepository : JpaRepository<LedgerEntry, String> {
     ): Boolean
 
     @Query("""
-        SELECT e.ledgerAccountId, e.entryType, SUM(e.amount)
-        FROM LedgerEntry e
-        GROUP BY e.ledgerAccountId, e.entryType
+        SELECT a.name, e.entryType, SUM(e.amount)
+        FROM LedgerEntry e JOIN LedgerAccount a ON e.ledgerAccountId = a.id
+        GROUP BY a.name, e.entryType
     """)
-    fun findBalancesByAccount(): List<Array<Any>>
+    fun findBalancesWithAccountName(): List<Array<Any>>
 }

@@ -54,4 +54,15 @@ class PaymentExpiryService(
         paymentIntentRepository.save(intent)
         return true
     }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    fun expireCaptureAttemptsBatch(batch: List<InternalAttempt>) {
+        val now = Instant.now()
+        for (ia in batch) {
+            log.warn("Expiring capture-hung InternalAttempt ${ia.id} (created ${ia.createdAt}) — intent stays AUTHORIZED for retry")
+            ia.status = InternalAttemptStatus.EXPIRED
+            ia.updatedAt = now
+            internalAttemptRepository.save(ia)
+        }
+    }
 }

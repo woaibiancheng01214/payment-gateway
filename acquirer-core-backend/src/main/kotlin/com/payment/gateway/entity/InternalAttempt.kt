@@ -19,7 +19,14 @@ enum class InternalAttemptType {
 }
 
 @Entity
-@Table(name = "internal_attempts")
+@Table(
+    name = "internal_attempts",
+    indexes = [
+        Index(name = "idx_ia_attempt_id", columnList = "paymentAttemptId"),
+        Index(name = "idx_ia_dispatched_status_created", columnList = "dispatched, status, createdAt"),
+        Index(name = "idx_ia_type_status_created", columnList = "type, status, createdAt")
+    ]
+)
 data class InternalAttempt(
     @Id
     val id: String = UUID.randomUUID().toString(),

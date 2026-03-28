@@ -69,13 +69,12 @@ class LedgerService(
         entryRepository.findByPaymentIntentIdOrderByCreatedAtAsc(paymentIntentId)
 
     fun getBalances(): Map<String, Map<String, Long>> {
-        val raw = entryRepository.findBalancesByAccount()
+        val raw = entryRepository.findBalancesWithAccountName()
         val result = mutableMapOf<String, MutableMap<String, Long>>()
         for (row in raw) {
-            val accountId = row[0] as String
+            val accountName = row[0] as String
             val entryType = (row[1] as EntryType).name
             val sum = row[2] as Long
-            val accountName = accountRepository.findById(accountId).map { it.name }.orElse(accountId)
             result.getOrPut(accountName) { mutableMapOf() }[entryType] = sum
         }
         return result

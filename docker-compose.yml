@@ -14,6 +14,13 @@ services:
         -c wal_level=logical
         -c max_wal_senders=4
         -c max_replication_slots=4
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1gb
+        reservations:
+          memory: 256mb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -78,7 +85,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_gateway
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/acquirer_core
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
       GATEWAY_SERVER_URL: http://external-payment-gateway:8081

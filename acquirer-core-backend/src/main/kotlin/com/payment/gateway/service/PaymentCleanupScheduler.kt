@@ -57,11 +57,11 @@ class PaymentCleanupScheduler(
     }
 
     /**
-     * Finds CAPTURE InternalAttempts older than capture-timeout and marks them EXPIRED.
+     * Finds CAPTURE InternalAttempts older than capture-timeout and marks them EXPIRED
+     * in batches of 10 to minimize transaction size and lock contention.
      * The PaymentIntent stays AUTHORIZED so the merchant can retry capture.
      */
     @Scheduled(fixedDelayString = "\${payment.cleanup.interval-seconds:10}000")
-    @Transactional
     fun sweepExpiredCaptureAttempts() {
         val captureDeadline = Instant.now().minusSeconds(captureTimeoutSeconds)
         val staleCaptures = internalAttemptRepository.findStaleByTypeAndCreatedAtBefore(
@@ -70,13 +70,16 @@ class PaymentCleanupScheduler(
         if (staleCaptures.isEmpty()) return
 
         log.info("Cleanup: found ${staleCaptures.size} stale CAPTURE attempt(s)")
-        val now = Instant.now()
-        for (ia in staleCaptures) {
-            log.warn("Expiring capture-hung InternalAttempt ${ia.id} (created ${ia.createdAt}) — intent stays AUTHORIZED for retry")
-            ia.status = InternalAttemptStatus.EXPIRED
-            ia.updatedAt = now
-            internalAttemptRepository.save(ia)
+        var expired = 0
+        for (batch in staleCaptures.chunked(10)) {
+            try {
+                paymentExpiryService.expireCaptureAttemptsBatch(batch)
+                expired += batch.size
+            } catch (e: Exception) {
+                log.error("Failed to expire capture batch: ${e.message}")
+            }
         }
+        if (expired > 0) log.info("Cleanup: expired $expired capture attempt(s)")
     }
 
     /**
@@ -87,7 +90,7 @@ class PaymentCleanupScheduler(
     @Scheduled(fixedDelayString = "\${payment.dispatch.retry-interval-seconds:3}000")
     fun sweepUndispatchedAttempts() {
         val staleThreshold = Instant.now().minusSeconds(dispatchStaleSeconds)
-        val undispatched = internalAttemptRepository.findUndispatched(staleThreshold)
+        val undispatched = internalAttemptRepository.findUndispatched(staleThreshold, batchSize)
         if (undispatched.isEmpty()) return
 
         log.info("Dispatch-retry: found ${undispatched.size} undispatched attempt(s)")

@@ -4,17 +4,18 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.payment.gateway.dto.*
 import com.payment.gateway.entity.*
 import com.payment.gateway.repository.*
+import com.payment.gateway.util.HashUtils
 import jakarta.persistence.EntityManager
 import jakarta.persistence.PersistenceContext
 import org.slf4j.LoggerFactory
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
-import org.springframework.transaction.support.TransactionSynchronization
-import org.springframework.transaction.support.TransactionSynchronizationManager
+import org.springframework.transaction.support.TransactionTemplate
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.time.Instant
-import java.util.concurrent.Executors
 
 @Service
 class PaymentIntentService(
@@ -24,10 +25,10 @@ class PaymentIntentService(
     private val idempotencyKeyRepository: IdempotencyKeyRepository,
     private val gatewayClient: GatewayClient,
     private val dispatchMarkService: DispatchMarkService,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val transactionTemplate: TransactionTemplate
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val dispatchExecutor = Executors.newFixedThreadPool(32)
 
     @PersistenceContext
     private lateinit var entityManager: EntityManager
@@ -58,17 +59,12 @@ class PaymentIntentService(
         request: CreatePaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
-        if (idempotencyKey != null) {
-            // Acquire the advisory lock FIRST so that concurrent requests with the same key
-            // are serialized at the database level across all application instances.
-            // Only after this lock is granted do we check-and-write — eliminating the
-            // check-then-act race entirely.
+        val requestHash = if (idempotencyKey != null) {
             acquireIdempotencyLock(idempotencyKey)
-
-            val requestHash = hashRequest("${request.amount}${request.currency.uppercase()}")
+            val hash = HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
             val existing = idempotencyKeyRepository.findById(idempotencyKey)
             if (existing.isPresent) {
-                if (existing.get().requestHash != requestHash) {
+                if (existing.get().requestHash != hash) {
                     throw IllegalArgumentException(
                         "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
                     )
@@ -76,7 +72,8 @@ class PaymentIntentService(
                 log.info("Returning cached create response for idempotency key $idempotencyKey")
                 return objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
             }
-        }
+            hash
+        } else null
 
         val intent = PaymentIntent(
             amount = request.amount,
@@ -87,11 +84,10 @@ class PaymentIntentService(
         val response = intent.toResponse()
 
         if (idempotencyKey != null) {
-            val requestHash = hashRequest("${request.amount}${request.currency.uppercase()}")
             idempotencyKeyRepository.save(
                 IdempotencyKey(
                     key = idempotencyKey,
-                    requestHash = requestHash,
+                    requestHash = requestHash!!,
                     response = objectMapper.writeValueAsString(response)
                 )
             )
@@ -99,127 +95,120 @@ class PaymentIntentService(
         return response
     }
 
-    @Transactional
     fun confirmPaymentIntent(
         intentId: String,
         request: ConfirmPaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
-        val intent = paymentIntentRepository.findByIdForUpdate(intentId)
-            .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
+        val (response, attemptToDispatch) = transactionTemplate.execute {
+            val intent = paymentIntentRepository.findByIdForUpdate(intentId)
+                .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
-        if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) {
-            throw IllegalStateException("PaymentIntent is not in requires_confirmation state")
-        }
-
-        if (idempotencyKey != null) {
-            val requestHash = hashRequest(intentId + request.paymentMethod)
-            val existing = idempotencyKeyRepository.findById(idempotencyKey)
-            if (existing.isPresent) {
-                if (existing.get().requestHash != requestHash) {
-                    throw IllegalArgumentException("Idempotency key reused with different request payload")
-                }
-                log.info("Returning cached idempotency response for key $idempotencyKey")
-                return objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
+            if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) {
+                throw IllegalStateException("PaymentIntent is not in requires_confirmation state")
             }
-        }
 
-        // Guard against duplicate confirms racing past the status check
-        val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
-        if (existingAttempt != null) {
-            log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
-            return intent.toResponse()
-        }
+            if (idempotencyKey != null) {
+                val requestHash = HashUtils.sha256(intentId + request.paymentMethod)
+                val existing = idempotencyKeyRepository.findById(idempotencyKey)
+                if (existing.isPresent) {
+                    if (existing.get().requestHash != requestHash) {
+                        throw IllegalArgumentException("Idempotency key reused with different request payload")
+                    }
+                    log.info("Returning cached idempotency response for key $idempotencyKey")
+                    return@execute Pair(objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java), null)
+                }
+            }
 
-        val attempt = PaymentAttempt(
-            paymentIntentId = intentId,
-            paymentMethod = request.paymentMethod,
-            status = PaymentAttemptStatus.PENDING
-        )
-        paymentAttemptRepository.save(attempt)
+            val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
+            if (existingAttempt != null) {
+                log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
+                return@execute Pair(intent.toResponse(), null)
+            }
 
-        val internalAttempt = InternalAttempt(
-            paymentAttemptId = attempt.id,
-            type = InternalAttemptType.AUTH,
-            requestPayload = objectMapper.writeValueAsString(
-                mapOf("paymentMethod" to request.paymentMethod, "amount" to intent.amount, "currency" to intent.currency)
+            val attempt = PaymentAttempt(
+                paymentIntentId = intentId,
+                paymentMethod = request.paymentMethod,
+                status = PaymentAttemptStatus.PENDING
             )
-        )
-        internalAttemptRepository.save(internalAttempt)
+            paymentAttemptRepository.save(attempt)
 
-        val response = intent.toResponse()
-
-        if (idempotencyKey != null) {
-            val requestHash = hashRequest(intentId + request.paymentMethod)
-            idempotencyKeyRepository.save(
-                IdempotencyKey(
-                    key = idempotencyKey,
-                    requestHash = requestHash,
-                    response = objectMapper.writeValueAsString(response)
+            val internalAttempt = InternalAttempt(
+                paymentAttemptId = attempt.id,
+                type = InternalAttemptType.AUTH,
+                requestPayload = objectMapper.writeValueAsString(
+                    mapOf("paymentMethod" to request.paymentMethod, "amount" to intent.amount, "currency" to intent.currency)
                 )
             )
-        }
+            internalAttemptRepository.save(internalAttempt)
 
-        scheduleDispatchAfterCommit(internalAttempt)
+            val resp = intent.toResponse()
+
+            if (idempotencyKey != null) {
+                val requestHash = HashUtils.sha256(intentId + request.paymentMethod)
+                idempotencyKeyRepository.save(
+                    IdempotencyKey(
+                        key = idempotencyKey,
+                        requestHash = requestHash,
+                        response = objectMapper.writeValueAsString(resp)
+                    )
+                )
+            }
+
+            Pair(resp, internalAttempt as InternalAttempt?)
+        }!!
+
+        // Transaction committed, DB connection released — safe to block on gateway
+        dispatchBestEffort(attemptToDispatch)
         return response
     }
 
-    @Transactional
     fun capturePaymentIntent(intentId: String): PaymentIntentResponse {
-        val intent = paymentIntentRepository.findByIdForUpdate(intentId)
-            .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
+        val (response, attemptToDispatch) = transactionTemplate.execute {
+            val intent = paymentIntentRepository.findByIdForUpdate(intentId)
+                .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
-        if (intent.status == PaymentIntentStatus.EXPIRED) {
-            throw IllegalStateException("PaymentIntent has expired — cannot capture")
-        }
-        if (intent.status != PaymentIntentStatus.AUTHORIZED) {
-            throw IllegalStateException("PaymentIntent must be in authorized state to capture (current: ${intent.status})")
-        }
+            if (intent.status == PaymentIntentStatus.EXPIRED) {
+                throw IllegalStateException("PaymentIntent has expired — cannot capture")
+            }
+            if (intent.status != PaymentIntentStatus.AUTHORIZED) {
+                throw IllegalStateException("PaymentIntent must be in authorized state to capture (current: ${intent.status})")
+            }
 
-        val attempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
-            ?: throw IllegalStateException("No PaymentAttempt found for intent $intentId")
+            val attempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
+                ?: throw IllegalStateException("No PaymentAttempt found for intent $intentId")
 
-        // Guard against concurrent captures racing past the status check
-        val alreadyCapturing = internalAttemptRepository.findByPaymentAttemptId(attempt.id)
-            .any { it.type == InternalAttemptType.CAPTURE }
-        if (alreadyCapturing) {
-            log.warn("Duplicate capture blocked for intent $intentId")
-            return intent.toResponse()
-        }
+            val alreadyCapturing = internalAttemptRepository.findByPaymentAttemptId(attempt.id)
+                .any { it.type == InternalAttemptType.CAPTURE }
+            if (alreadyCapturing) {
+                log.warn("Duplicate capture blocked for intent $intentId")
+                return@execute Pair(intent.toResponse(), null)
+            }
 
-        val internalAttempt = InternalAttempt(
-            paymentAttemptId = attempt.id,
-            type = InternalAttemptType.CAPTURE,
-            requestPayload = objectMapper.writeValueAsString(
-                mapOf("paymentAttemptId" to attempt.id, "action" to "capture")
+            val internalAttempt = InternalAttempt(
+                paymentAttemptId = attempt.id,
+                type = InternalAttemptType.CAPTURE,
+                requestPayload = objectMapper.writeValueAsString(
+                    mapOf("paymentAttemptId" to attempt.id, "action" to "capture")
+                )
             )
-        )
-        internalAttemptRepository.save(internalAttempt)
+            internalAttemptRepository.save(internalAttempt)
 
-        scheduleDispatchAfterCommit(internalAttempt)
-        return intent.toResponse()
+            Pair(intent.toResponse(), internalAttempt as InternalAttempt?)
+        }!!
+
+        dispatchBestEffort(attemptToDispatch)
+        return response
     }
 
-    /**
-     * Registers a post-commit callback that dispatches the InternalAttempt to the gateway
-     * AFTER the DB transaction has successfully committed. If the dispatch fails (network
-     * timeout, gateway down), the attempt stays dispatched=false and the scheduler will
-     * retry it within a few seconds.
-     */
-    private fun scheduleDispatchAfterCommit(internalAttempt: InternalAttempt) {
-        val attemptId = internalAttempt.id
-        TransactionSynchronizationManager.registerSynchronization(object : TransactionSynchronization {
-            override fun afterCommit() {
-                dispatchExecutor.submit {
-                    try {
-                        gatewayClient.dispatch(internalAttempt)
-                        dispatchMarkService.markDispatched(attemptId)
-                    } catch (e: Exception) {
-                        log.warn("Post-commit dispatch failed for $attemptId — scheduler will retry: ${e.message}")
-                    }
-                }
-            }
-        })
+    private fun dispatchBestEffort(internalAttempt: InternalAttempt?) {
+        if (internalAttempt == null) return
+        try {
+            gatewayClient.dispatch(internalAttempt)
+            dispatchMarkService.markDispatched(internalAttempt.id)
+        } catch (e: Exception) {
+            log.warn("Dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
+        }
     }
 
     @Transactional
@@ -345,8 +334,12 @@ class PaymentIntentService(
             .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
         val attempts = paymentAttemptRepository.findByPaymentIntentId(intentId)
+        val attemptIds = attempts.map { it.id }
+        val allInternalAttempts = if (attemptIds.isNotEmpty()) {
+            internalAttemptRepository.findByPaymentAttemptIdIn(attemptIds).groupBy { it.paymentAttemptId }
+        } else emptyMap()
+
         val attemptDetails = attempts.map { attempt ->
-            val internalAttempts = internalAttemptRepository.findByPaymentAttemptId(attempt.id)
             PaymentAttemptDetailResponse(
                 id = attempt.id,
                 paymentIntentId = attempt.paymentIntentId,
@@ -354,7 +347,7 @@ class PaymentIntentService(
                 status = attempt.status.name.lowercase(),
                 createdAt = attempt.createdAt,
                 updatedAt = attempt.updatedAt,
-                internalAttempts = internalAttempts.map { it.toResponse() }
+                internalAttempts = (allInternalAttempts[attempt.id] ?: emptyList()).map { it.toResponse() }
             )
         }
 
@@ -369,11 +362,6 @@ class PaymentIntentService(
         )
     }
 
-    fun listPaymentIntents(): List<PaymentIntentResponse> =
-        paymentIntentRepository.findAll().map { it.toResponse() }
-
-    private fun hashRequest(input: String): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        return digest.digest(input.toByteArray()).joinToString("") { "%02x".format(it) }
-    }
+    fun listPaymentIntents(pageable: Pageable): Page<PaymentIntentResponse> =
+        paymentIntentRepository.findAll(pageable).map { it.toResponse() }
 }

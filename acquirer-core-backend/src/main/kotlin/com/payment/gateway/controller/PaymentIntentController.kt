@@ -2,6 +2,9 @@ package com.payment.gateway.controller
 
 import com.payment.gateway.dto.*
 import com.payment.gateway.service.PaymentIntentService
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
+import org.springframework.data.web.PageableDefault
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -45,8 +48,8 @@ class PaymentIntentController(
     }
 
     @GetMapping
-    fun list(): ResponseEntity<List<PaymentIntentResponse>> {
-        return ResponseEntity.ok(paymentIntentService.listPaymentIntents())
+    fun list(@PageableDefault(size = 20) pageable: Pageable): ResponseEntity<Page<PaymentIntentResponse>> {
+        return ResponseEntity.ok(paymentIntentService.listPaymentIntents(pageable))
     }
 
     @ExceptionHandler(IllegalArgumentException::class)

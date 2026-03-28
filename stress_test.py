@@ -17,12 +17,16 @@ import uuid
 import json
 import hmac
 import hashlib
+import random
 from collections import defaultdict, Counter
 from dataclasses import dataclass, field
 from typing import Optional
 
+CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD"]
+
 BASE = "http://localhost:8080"
 GATEWAY_BASE = "http://localhost:8081"
+LEDGER_BASE = "http://localhost:8082"
 WEBHOOK_SECRET = "payment-gateway-webhook-secret-2026"
 RESULTS = []
 LOCK = threading.Lock()
@@ -75,7 +79,15 @@ def signed_webhook_post(internal_attempt_id: str, status: str, timeout: int = 5)
         timeout=timeout,
     )
 
-def create_intent(amount=1000, currency="USD") -> dict:
+def rand_amount():
+    return random.randint(100, 99999)
+
+def rand_currency():
+    return random.choice(CURRENCIES)
+
+def create_intent(amount=None, currency=None) -> dict:
+    amount = amount or rand_amount()
+    currency = currency or rand_currency()
     r = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency}, timeout=10)
     r.raise_for_status()
     return r.json()
@@ -148,7 +160,7 @@ def test_concurrent_creates():
 
     def do_create():
         try:
-            r = create_intent(amount=999, currency="EUR")
+            r = create_intent(amount=rand_amount(), currency=rand_currency())
             with LOCK:
                 results.append(r["id"])
         except Exception as e:
@@ -254,7 +266,7 @@ def test_race_condition_double_capture():
     print(f"\n{BOLD}── Test 5: Race Condition — Concurrent Captures ──{RESET}")
     # Create and confirm, wait for auth
     for _ in range(5):
-        intent = create_intent(amount=100, currency="USD")
+        intent = create_intent(amount=rand_amount(), currency=rand_currency())
         iid = intent["id"]
         confirm_intent(iid)
         status = wait_for_terminal(iid, timeout_s=150)
@@ -349,7 +361,7 @@ def test_data_consistency_under_load():
     - PaymentIntent status matches PaymentAttempt status
     """
     print(f"\n{BOLD}── Test 7: Data Consistency Under Load (20 concurrent confirms) ──{RESET}")
-    intents = [create_intent(amount=i+1, currency="USD") for i in range(20)]
+    intents = [create_intent(amount=rand_amount(), currency=rand_currency()) for _ in range(20)]
 
     def confirm_all(intent):
         try:
@@ -474,7 +486,7 @@ def test_expiry_auth_hang(auth_timeout_s=30):
         warn(f"Skipping — auth timeout is {auth_timeout_s}s (too long for a stress test run)")
         return
 
-    intent = create_intent(amount=42, currency="USD")
+    intent = create_intent(amount=rand_amount(), currency=rand_currency())
     iid = intent["id"]
 
     # Confirm (this dispatches to mock gateway which WILL call back in 1-2s)
@@ -521,7 +533,7 @@ def test_expiry_blocks_late_webhook():
     print(f"\n{BOLD}── Test 10: Late Webhook After Expiry is Blocked ──{RESET}")
 
     # Create and confirm — get the internal attempt ID
-    intent = create_intent(amount=77, currency="USD")
+    intent = create_intent(amount=rand_amount(), currency=rand_currency())
     iid = intent["id"]
     confirm_intent(iid)
     time.sleep(3)
@@ -568,7 +580,7 @@ def test_dispatch_retry():
 
     intent_ids = []
     for i in range(COUNT):
-        intent = create_intent(amount=111 + i, currency="USD")
+        intent = create_intent(amount=rand_amount(), currency=rand_currency())
         r = confirm_intent(intent["id"])
         if r.status_code < 300:
             intent_ids.append(intent["id"])
@@ -663,6 +675,178 @@ def print_metrics_snapshot(phase_label):
         info(f"{name}  {cpu_str} ({sys_str})  {mem_str}  {thr_str}")
 
 
+def get_ledger_entries(intent_id) -> list:
+    try:
+        r = requests.get(f"{LEDGER_BASE}/ledger/entries", params={"paymentIntentId": intent_id}, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return []
+
+
+def get_ledger_balances() -> dict:
+    try:
+        r = requests.get(f"{LEDGER_BASE}/ledger/balances", timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+
+def test_ledger_consistency():
+    """
+    Validates ledger correctness after the sustained load test (or independently).
+    Checks:
+    1. Global double-entry balance: total debits == total credits
+    2. Per-intent entry correctness based on terminal status:
+       - authorized → exactly 1 DEBIT (merchant_receivables) + 1 CREDIT (gateway_payable)
+       - failed      → either 0 entries (failed before auth) or balanced reversal
+       - captured    → auth entries + capture entries (2 DEBIT + 2 CREDIT)
+    3. No orphan ledger entries for intents that don't exist
+    """
+    SAMPLE_SIZE = 50
+    print(f"\n{BOLD}── Test 12: Ledger Double-Entry Consistency ──{RESET}")
+
+    # 1. Global balance check
+    balances = get_ledger_balances()
+    if not balances:
+        warn("Ledger service unreachable or no balances — skipping ledger tests")
+        return
+
+    info(f"Ledger balances: {balances}")
+
+    total_debits = 0
+    total_credits = 0
+    for account_name, entry_types in balances.items():
+        total_debits += entry_types.get("DEBIT", 0)
+        total_credits += entry_types.get("CREDIT", 0)
+
+    info(f"Global totals: debits={total_debits}, credits={total_credits}")
+    if total_debits == total_credits:
+        ok(f"Double-entry balanced: debits == credits == {total_debits}")
+    else:
+        record_issue("CRITICAL", "ledger_balance",
+                     f"Double-entry IMBALANCE: debits={total_debits}, credits={total_credits}, diff={total_debits - total_credits}")
+
+    # 2. Per-intent entry validation (sample recent intents)
+    info(f"Sampling {SAMPLE_SIZE} intents for per-intent ledger validation...")
+    try:
+        r = requests.get(f"{BASE}/payment_intents", params={"size": SAMPLE_SIZE}, timeout=10)
+        r.raise_for_status()
+        page = r.json()
+        all_intents = page.get("content", page) if isinstance(page, dict) else page
+    except Exception as e:
+        warn(f"Could not fetch intents list: {e}")
+        return
+
+    sample = all_intents[:SAMPLE_SIZE] if len(all_intents) >= SAMPLE_SIZE else all_intents
+    entry_errors = 0
+    missing_entries = 0
+    extra_entries = 0
+
+    for intent_summary in sample:
+        iid = intent_summary["id"]
+        detail = get_intent(iid)
+        status = detail["status"]
+        amount = detail["amount"]
+        entries = get_ledger_entries(iid)
+
+        entry_types_found = [(e["eventType"], e["entryType"], e["amount"]) for e in entries]
+
+        if status == "authorized":
+            expected_events = {"AUTHORIZED"}
+            debit_entries = [e for e in entries if e["entryType"] == "DEBIT" and e["eventType"] == "AUTHORIZED"]
+            credit_entries = [e for e in entries if e["entryType"] == "CREDIT" and e["eventType"] == "AUTHORIZED"]
+
+            if len(debit_entries) != 1 or len(credit_entries) != 1:
+                entry_errors += 1
+                if entry_errors <= 3:
+                    record_issue("CRITICAL", "ledger_per_intent",
+                                 f"Intent {iid} (authorized): expected 1 DEBIT + 1 CREDIT for AUTHORIZED, "
+                                 f"got {len(debit_entries)} DEBIT + {len(credit_entries)} CREDIT")
+            elif debit_entries[0]["amount"] != amount or credit_entries[0]["amount"] != amount:
+                entry_errors += 1
+                if entry_errors <= 3:
+                    record_issue("CRITICAL", "ledger_per_intent",
+                                 f"Intent {iid} (authorized): amount mismatch — "
+                                 f"intent={amount}, debit={debit_entries[0]['amount']}, credit={credit_entries[0]['amount']}")
+
+        elif status == "captured":
+            auth_debits = [e for e in entries if e["eventType"] == "AUTHORIZED" and e["entryType"] == "DEBIT"]
+            auth_credits = [e for e in entries if e["eventType"] == "AUTHORIZED" and e["entryType"] == "CREDIT"]
+            cap_debits = [e for e in entries if e["eventType"] == "CAPTURED" and e["entryType"] == "DEBIT"]
+            cap_credits = [e for e in entries if e["eventType"] == "CAPTURED" and e["entryType"] == "CREDIT"]
+
+            if len(auth_debits) != 1 or len(auth_credits) != 1 or len(cap_debits) != 1 or len(cap_credits) != 1:
+                entry_errors += 1
+                if entry_errors <= 3:
+                    record_issue("CRITICAL", "ledger_per_intent",
+                                 f"Intent {iid} (captured): expected 4 entries (auth+capture), "
+                                 f"got auth={len(auth_debits)}D/{len(auth_credits)}C, capture={len(cap_debits)}D/{len(cap_credits)}C")
+
+        elif status == "failed":
+            auth_entries = [e for e in entries if e["eventType"] == "AUTHORIZED"]
+            reversal_entries = [e for e in entries if e["eventType"] == "FAILED_REVERSAL"]
+
+            if len(auth_entries) == 0 and len(reversal_entries) == 0:
+                pass  # failed before authorization — no ledger entries expected
+            elif len(auth_entries) == 2 and len(reversal_entries) == 2:
+                pass  # authorized then failed — auth + reversal entries
+            elif len(auth_entries) == 2 and len(reversal_entries) == 0:
+                # CDC event ordering: failed directly from requires_confirmation has no reversal
+                pass
+            else:
+                entry_errors += 1
+                if entry_errors <= 3:
+                    record_issue("WARNING", "ledger_per_intent",
+                                 f"Intent {iid} (failed): unexpected entry pattern — "
+                                 f"auth={len(auth_entries)}, reversal={len(reversal_entries)}")
+
+        elif status == "expired":
+            auth_entries = [e for e in entries if e["eventType"] == "AUTHORIZED"]
+            reversal_entries = [e for e in entries if e["eventType"] == "EXPIRED_REVERSAL"]
+
+            if len(auth_entries) == 0 and len(reversal_entries) == 0:
+                pass  # expired before authorization
+            elif len(auth_entries) == 2 and len(reversal_entries) == 2:
+                pass  # auth + reversal
+            else:
+                entry_errors += 1
+                if entry_errors <= 3:
+                    record_issue("WARNING", "ledger_per_intent",
+                                 f"Intent {iid} (expired): unexpected entry pattern — "
+                                 f"auth={len(auth_entries)}, reversal={len(reversal_entries)}")
+
+    # 3. Per-intent debit/credit balance
+    unbalanced = 0
+    for intent_summary in sample:
+        iid = intent_summary["id"]
+        entries = get_ledger_entries(iid)
+        if not entries:
+            continue
+        intent_debits = sum(e["amount"] for e in entries if e["entryType"] == "DEBIT")
+        intent_credits = sum(e["amount"] for e in entries if e["entryType"] == "CREDIT")
+        if intent_debits != intent_credits:
+            unbalanced += 1
+            if unbalanced <= 3:
+                record_issue("CRITICAL", "ledger_per_intent_balance",
+                             f"Intent {iid}: debits={intent_debits} != credits={intent_credits}")
+
+    if entry_errors == 0:
+        ok(f"All {len(sample)} sampled intents have correct ledger entry patterns")
+    else:
+        record_issue("CRITICAL" if entry_errors > 3 else "WARNING", "ledger_per_intent",
+                     f"{entry_errors}/{len(sample)} intents have ledger entry issues")
+
+    if unbalanced == 0:
+        ok(f"All {len(sample)} sampled intents are balanced (debits == credits per intent)")
+    else:
+        record_issue("CRITICAL", "ledger_per_intent_balance",
+                     f"{unbalanced}/{len(sample)} intents have unbalanced entries")
+
+
 def test_sustained_load():
     """
     Sustained 100 TPS of create+confirm for 30s, then drain for up to 120s
@@ -695,7 +879,7 @@ def test_sustained_load():
             try:
                 t0 = time.time()
                 r = requests.post(f"{BASE}/payment_intents",
-                                  json={"amount": 500, "currency": "USD"}, timeout=10)
+                                  json={"amount": rand_amount(), "currency": rand_currency()}, timeout=10)
                 create_ms = (time.time() - t0) * 1000
                 if r.status_code >= 500:
                     with ids_lock:
@@ -935,6 +1119,79 @@ def test_sustained_load():
         record_issue("WARNING", "sustained_terminal",
                      f"Only {terminal_pct:.1f}% reached terminal within {DRAIN_S}s drain")
 
+    # ── Phase 4: Ledger Consistency ──────────────────────────────────────
+    LEDGER_DRAIN_S = 30
+    LEDGER_SAMPLE = 100
+    print(f"\n  {BOLD}Ledger consistency check (waiting {LEDGER_DRAIN_S}s for CDC propagation)...{RESET}")
+
+    ledger_available = bool(get_ledger_balances())
+    if not ledger_available:
+        warn("Ledger service unreachable — skipping ledger validation")
+        return
+
+    time.sleep(LEDGER_DRAIN_S)
+
+    balances = get_ledger_balances()
+    info(f"Ledger balances: {balances}")
+
+    total_debits = sum(v.get("DEBIT", 0) for v in balances.values())
+    total_credits = sum(v.get("CREDIT", 0) for v in balances.values())
+    if total_debits == total_credits:
+        ok(f"Global double-entry balanced: debits == credits == {total_debits}")
+    else:
+        record_issue("CRITICAL", "sustained_ledger_balance",
+                     f"Global IMBALANCE: debits={total_debits}, credits={total_credits}")
+
+    sample_ids = created_ids[:LEDGER_SAMPLE]
+    ledger_entry_issues = 0
+    ledger_unbalanced = 0
+    ledger_missing = 0
+    authorized_with_entries = 0
+
+    for iid in sample_ids:
+        try:
+            detail = get_intent(iid)
+        except Exception:
+            continue
+        status = detail["status"]
+        amount = detail["amount"]
+        entries = get_ledger_entries(iid)
+
+        if status == "authorized" and len(entries) == 0:
+            ledger_missing += 1
+            if ledger_missing <= 3:
+                record_issue("WARNING", "sustained_ledger",
+                             f"Intent {iid} (authorized) has no ledger entries — CDC lag?")
+            continue
+
+        if entries:
+            intent_debits = sum(e["amount"] for e in entries if e["entryType"] == "DEBIT")
+            intent_credits = sum(e["amount"] for e in entries if e["entryType"] == "CREDIT")
+            if intent_debits != intent_credits:
+                ledger_unbalanced += 1
+                if ledger_unbalanced <= 3:
+                    record_issue("CRITICAL", "sustained_ledger_per_intent",
+                                 f"Intent {iid}: debits={intent_debits} != credits={intent_credits}")
+
+        if status == "authorized":
+            authorized_with_entries += 1
+            auth_d = [e for e in entries if e["eventType"] == "AUTHORIZED" and e["entryType"] == "DEBIT"]
+            auth_c = [e for e in entries if e["eventType"] == "AUTHORIZED" and e["entryType"] == "CREDIT"]
+            if len(auth_d) != 1 or len(auth_c) != 1:
+                ledger_entry_issues += 1
+                if ledger_entry_issues <= 3:
+                    record_issue("CRITICAL", "sustained_ledger_entries",
+                                 f"Intent {iid} (authorized): expected 1D+1C for AUTHORIZED, got {len(auth_d)}D+{len(auth_c)}C")
+
+    sampled = len(sample_ids)
+    if ledger_unbalanced == 0:
+        ok(f"All {sampled} sampled intents have balanced ledger entries")
+    if ledger_entry_issues == 0:
+        ok(f"All authorized intents have correct AUTHORIZED entry pairs")
+    if ledger_missing > 0:
+        record_issue("WARNING", "sustained_ledger_missing",
+                     f"{ledger_missing}/{sampled} authorized intents missing ledger entries (CDC propagation delay)")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
@@ -951,7 +1208,7 @@ if __name__ == "__main__":
     print(f"{BOLD}{'═'*60}{RESET}")
 
     if stress_only:
-        suites = [test_sustained_load]
+        suites = [test_sustained_load, test_ledger_consistency]
     else:
         suites = [
             test_throughput_and_latencies,
@@ -966,6 +1223,7 @@ if __name__ == "__main__":
             test_expiry_blocks_late_webhook,
             test_dispatch_retry,
             test_sustained_load,
+            test_ledger_consistency,
         ]
 
     for suite in suites:

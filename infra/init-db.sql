@@ -1,5 +1,5 @@
 -- Creates both databases and configures logical replication for Debezium CDC
-CREATE DATABASE payment_gateway;
+CREATE DATABASE acquirer_core;
 CREATE DATABASE ledger;
 
 -- Debezium requires wal_level=logical; set via postgresql.conf in docker-compose.
