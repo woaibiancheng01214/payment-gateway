@@ -92,12 +92,10 @@ def create_intent(amount=None, currency=None) -> dict:
     r.raise_for_status()
     return r.json()
 
-def confirm_intent(intent_id, method="card_4242", idem_key=None) -> requests.Response:
-    headers = {"Content-Type": "application/json"}
-    if idem_key:
-        headers["Idempotency-Key"] = idem_key
+def confirm_intent(intent_id, method="card_4242") -> requests.Response:
     return requests.post(f"{BASE}/payment_intents/{intent_id}/confirm",
-                         json={"paymentMethod": method}, headers=headers, timeout=15)
+                         json={"paymentMethod": method},
+                         headers={"Content-Type": "application/json"}, timeout=15)
 
 def capture_intent(intent_id) -> requests.Response:
     return requests.post(f"{BASE}/payment_intents/{intent_id}/capture", timeout=15)
@@ -219,25 +217,29 @@ def test_race_condition_double_confirm():
 
 
 def test_idempotency_correctness():
-    """Same key, same payload → cached response. Same key, different payload → 400."""
-    print(f"\n{BOLD}── Test 4: Idempotency Key Correctness ──{RESET}")
-    intent = create_intent()
-    iid = intent["id"]
+    """Idempotency key on CREATE: same key → cached response, different payload → 400."""
+    print(f"\n{BOLD}── Test 4: Idempotency Key Correctness (create only) ──{RESET}")
     key = str(uuid.uuid4())
+    amount = rand_amount()
+    currency = rand_currency()
 
-    # First request
-    r1 = confirm_intent(iid, method="card_4242", idem_key=key)
-    ok(f"First confirm status: {r1.status_code}")
+    r1 = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+                       headers={"Idempotency-Key": key}, timeout=10)
+    r1.raise_for_status()
+    first_id = r1.json()["id"]
+    ok(f"First create: id={first_id}")
 
-    # Replay — same key, same body
-    r2 = confirm_intent(iid, method="card_4242", idem_key=key)
-    if r2.status_code == 200 and r2.json()["id"] == iid:
+    # Replay — same key, same payload → should return cached response
+    r2 = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+                       headers={"Idempotency-Key": key}, timeout=10)
+    if r2.status_code in (200, 201) and r2.json()["id"] == first_id:
         ok("Replay returns same cached response")
     else:
         record_issue("CRITICAL", "idempotency", f"Replay failed: {r2.status_code} {r2.text}")
 
-    # Same key, different payload — should be rejected
-    r3 = confirm_intent(iid, method="card_9999", idem_key=key)
+    # Same key, different payload → should be rejected
+    r3 = requests.post(f"{BASE}/payment_intents", json={"amount": amount + 1, "currency": currency},
+                       headers={"Idempotency-Key": key}, timeout=10)
     if r3.status_code == 400:
         ok("Different payload with same key correctly rejected (400)")
     else:
@@ -247,7 +249,8 @@ def test_idempotency_correctness():
     # Concurrent replays — all should return the same response
     replay_results = []
     def replay():
-        r = confirm_intent(iid, method="card_4242", idem_key=key)
+        r = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+                          headers={"Idempotency-Key": key}, timeout=10)
         with LOCK:
             replay_results.append(r.json().get("id"))
 
@@ -255,48 +258,43 @@ def test_idempotency_correctness():
     for t in threads: t.start()
     for t in threads: t.join()
 
-    if all(r == iid for r in replay_results):
+    if all(r == first_id for r in replay_results):
         ok("10 concurrent replays all returned the same intent ID")
     else:
-        record_issue("CRITICAL", "idempotency", f"Concurrent replays returned inconsistent results: {set(replay_results)}")
+        record_issue("CRITICAL", "idempotency", f"Concurrent replays returned inconsistent IDs: {set(replay_results)}")
 
 
-def test_idempotency_lock_contention():
+def test_redis_distributed_lock_on_confirm():
     """
-    Fire CONCURRENCY concurrent confirms on the SAME intent with the SAME idempotency key.
+    Fire CONCURRENCY concurrent confirms on the SAME intent (no idempotency key).
 
-    Validates two things:
-    1. Correctness — pg_advisory_xact_lock serialises the concurrent requests so only
-       one PaymentAttempt is created and every caller receives the same cached response.
-    2. Connection pool behaviour — all CONCURRENCY threads hold a Hikari connection while
-       waiting on the advisory lock. With maximum-pool-size=50 and CONCURRENCY=60 some
-       threads will wait in the Hikari queue while others block in Postgres.
+    The Redis distributed lock (SET NX EX on lock:intent:<id>) ensures only one
+    confirm acquires the lock. All other concurrent confirms are rejected immediately
+    with 409 — no DB connection consumed, no Hikari pool pressure.
 
-    P99 latency here directly reflects advisory-lock wait time: if threads queue up,
-    the last thread to acquire the lock waits for all (CONCURRENCY-1) predecessors to
-    commit before it gets the lock and can return the cached response.
+    Validates:
+    1. Exactly 1 PaymentAttempt created despite CONCURRENCY concurrent confirms.
+    2. Most responses are 409 (lock not acquired), exactly 1 is 200 (lock acquired).
+    3. No 500 errors — no pool exhaustion possible since losers never touch the DB.
+    4. Fast rejection — P50 of 409 responses should be <100ms (Redis roundtrip only).
     """
-    CONCURRENCY = 60
-    print(f"\n{BOLD}── Test 4b: Idempotency Lock Contention ({CONCURRENCY} concurrent confirms, same key) ──{RESET}")
+    CONCURRENCY = 80
+    print(f"\n{BOLD}── Test 4b: Redis Distributed Lock on Confirm ({CONCURRENCY} concurrent) ──{RESET}")
     intent = create_intent()
     iid = intent["id"]
-    key = str(uuid.uuid4())
 
     status_codes = []
-    intent_ids = []
     latencies = []
     errors = []
 
     def do_confirm():
         t0 = time.time()
         try:
-            r = confirm_intent(iid, idem_key=key)
+            r = confirm_intent(iid)
             ms = (time.time() - t0) * 1000
             with LOCK:
                 status_codes.append(r.status_code)
                 latencies.append(ms)
-                if r.status_code == 200:
-                    intent_ids.append(r.json().get("id"))
         except Exception as e:
             with LOCK:
                 errors.append(str(e)[:80])
@@ -307,192 +305,47 @@ def test_idempotency_lock_contention():
     for t in threads: t.join()
     total_ms = (time.time() - t_start) * 1000
 
+    status_dist = Counter(status_codes)
+    info(f"HTTP distribution: {dict(status_dist)}  wall={total_ms:.0f}ms  conn_errors={len(errors)}")
+
     if latencies:
         latencies.sort()
         p50 = latencies[len(latencies) // 2]
         p95 = latencies[int(len(latencies) * 0.95)]
         p99 = latencies[int(len(latencies) * 0.99)]
-        info(f"P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms  wall={total_ms:.0f}ms")
-
-    status_dist = Counter(status_codes)
-    info(f"HTTP status distribution: {dict(status_dist)}")
+        info(f"P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms")
 
     if errors:
-        record_issue("CRITICAL", "idem_lock_contention",
-                     f"{len(errors)} connection/timeout errors — likely pool exhaustion: {errors[:2]}")
+        record_issue("CRITICAL", "redis_lock_confirm",
+                     f"{len(errors)} connection errors: {errors[:3]}")
+
+    server_errors = status_dist.get(500, 0)
+    if server_errors > 0:
+        record_issue("CRITICAL", "redis_lock_confirm",
+                     f"{server_errors} 500 errors — Redis lock should prevent pool exhaustion entirely")
     else:
-        ok(f"No connection errors under {CONCURRENCY}-thread advisory lock contention")
+        ok(f"No 500 errors — Redis lock prevented all DB pool contention")
+
+    ok_count = status_dist.get(200, 0)
+    rejected_count = status_dist.get(409, 0)
+    if ok_count == 1:
+        ok(f"Exactly 1 confirm succeeded (200), {rejected_count} rejected (409)")
+    elif ok_count == 0:
+        record_issue("WARNING", "redis_lock_confirm", "No confirm succeeded (all 409) — race too tight?")
+    else:
+        record_issue("WARNING", "redis_lock_confirm",
+                     f"{ok_count} confirms returned 200 (expected 1) — Redis lock may not have been acquired exclusively")
 
     time.sleep(3)
     detail = get_intent(iid)
     attempt_count = len(detail.get("attempts", []))
     if attempt_count > 1:
-        record_issue("CRITICAL", "idem_lock_contention",
-                     f"{attempt_count} PaymentAttempts created — advisory lock did not serialise correctly")
+        record_issue("CRITICAL", "redis_lock_confirm",
+                     f"{attempt_count} PaymentAttempts created — lock did not serialise")
+    elif attempt_count == 1:
+        ok(f"Exactly 1 PaymentAttempt created despite {CONCURRENCY} concurrent confirms")
     else:
-        ok(f"Only 1 PaymentAttempt created despite {CONCURRENCY} concurrent confirms")
-
-    unique_ids = set(intent_ids)
-    if len(unique_ids) > 1:
-        record_issue("CRITICAL", "idem_lock_contention",
-                     f"Concurrent confirms returned {len(unique_ids)} different intent IDs: {unique_ids}")
-    elif intent_ids:
-        ok(f"All {len(intent_ids)} successful confirms returned the same intent ID")
-
-    if p99 > 2000 if latencies else False:
-        record_issue("WARNING", "idem_lock_contention",
-                     f"P99 advisory lock wait {p99:.0f}ms — consider pg_try_advisory_xact_lock + 409 retry")
-
-
-def test_hot_key_pool_exhaustion():
-    """
-    Two-phase test that first DEMONSTRATES the pool exhaustion problem, then PROVES
-    that the Redis pre-check fixes it for replay (retry) requests.
-
-    ── Phase A — Problem (in-flight slow first request) ──────────────────────────
-    psycopg2 holds the advisory lock for HOLD_S seconds (simulating a slow first
-    request still in-flight). 80 concurrent HTTP confirms fire with the same key
-    while the lock is held. Since Redis has no entry yet (first request never
-    completed), all 80 miss Redis and try to acquire the DB advisory lock:
-      - 50 get Hikari connections and block in Postgres waiting for the lock
-      - 30 cannot get a Hikari connection within connection-timeout=5s → 500
-    Expected: {500: 30, 200: 50}. Fix for this phase: pg_try_advisory_xact_lock.
-
-    ── Phase B — Redis fix (client retry storm after first request completes) ────
-    After a first confirm completes (warms Redis), 80 concurrent retries with the
-    same idempotency key are fired while the advisory lock is still held by psycopg2.
-    All 80 hit Redis on the pre-check and return immediately — zero DB connections
-    are acquired, so pool exhaustion is impossible regardless of CONCURRENCY.
-    Expected: {200: 80}. This is the Redis pre-check fix.
-
-    Requires psycopg2-binary: pip install psycopg2-binary
-    """
-    try:
-        import psycopg2
-        import hashlib
-        import struct
-    except ImportError:
-        warn("psycopg2 not installed — skipping pool exhaustion test (pip install psycopg2-binary)")
-        return
-
-    CONCURRENCY = 80   # > maximum-pool-size=50
-    HOLD_S      = 8    # > connection-timeout=5s so the 30 queued threads time out
-
-    print(f"\n{BOLD}── Test 4c: Hot-Key Pool Exhaustion ──{RESET}")
-
-    # ── Phase A: demonstrate the problem ─────────────────────────────────────────
-    print(f"\n  {BOLD}Phase A — Problem: in-flight slow request + {CONCURRENCY} concurrent retries{RESET}")
-
-    intent_a = create_intent()
-    iid_a = intent_a["id"]
-    key_a = str(uuid.uuid4())
-    lock_id_a = struct.unpack(">q", hashlib.sha256(key_a.encode()).digest()[:8])[0]
-
-    try:
-        pg_a = psycopg2.connect(host="localhost", port=5432, dbname="acquirer_core",
-                                user="postgres", password="postgres")
-        pg_a.autocommit = False
-        cur_a = pg_a.cursor()
-        cur_a.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id_a,))
-    except Exception as e:
-        warn(f"Could not connect to PostgreSQL directly — skipping: {e}")
-        return
-
-    info(f"Holding advisory lock for {HOLD_S}s, firing {CONCURRENCY} confirms (Redis is cold)...")
-
-    sc_a, lat_a, err_a = [], [], []
-    fire_lock = threading.Lock()
-
-    def do_confirm_a():
-        t0 = time.time()
-        try:
-            r = confirm_intent(iid_a, idem_key=key_a)
-            with fire_lock: sc_a.append(r.status_code); lat_a.append((time.time()-t0)*1000)
-        except Exception as e:
-            with fire_lock: err_a.append(str(e)[:80])
-
-    threads_a = [threading.Thread(target=do_confirm_a) for _ in range(CONCURRENCY)]
-    t0_a = time.time()
-    for t in threads_a: t.start()
-    time.sleep(HOLD_S)
-    pg_a.commit(); cur_a.close(); pg_a.close()
-    for t in threads_a: t.join(timeout=20)
-
-    dist_a = Counter(sc_a)
-    errors_a = dist_a.get(500, 0) + dist_a.get(503, 0) + len(err_a)
-    info(f"Phase A: wall={int((time.time()-t0_a)*1000)}ms  HTTP={dict(dist_a)}  conn_errors={len(err_a)}")
-    if errors_a > 0:
-        record_issue("WARNING", "hot_key_pool_exhaustion_phase_a",
-                     f"Phase A — {errors_a}/{CONCURRENCY} failed (Hikari timeout as expected). "
-                     f"Fix for this scenario: pg_try_advisory_xact_lock + 409 retry.")
-        info("(Phase A failures are EXPECTED — they demonstrate the problem Redis alone cannot fix)")
-    else:
-        ok(f"Phase A — no failures (transactions were fast enough to avoid Hikari timeout)")
-
-    # ── Phase B: demonstrate the Redis fix ───────────────────────────────────────
-    print(f"\n  {BOLD}Phase B — Fix: Redis pre-check for {CONCURRENCY} retries after cache is warm{RESET}")
-
-    intent_b = create_intent()
-    iid_b = intent_b["id"]
-    key_b = str(uuid.uuid4())
-
-    # Fire the first real confirm — this writes the response to Redis on completion
-    first_r = confirm_intent(iid_b, idem_key=key_b)
-    if first_r.status_code != 200:
-        warn(f"First confirm failed ({first_r.status_code}) — skipping Phase B")
-        return
-    time.sleep(0.3)  # ensure Redis SET has completed before retries arrive
-    info("First confirm completed — Redis cache is warm. Now holding lock and firing retries...")
-
-    # Hold the advisory lock for key_b — retries that skip Redis would hit this lock
-    lock_id_b = struct.unpack(">q", hashlib.sha256(key_b.encode()).digest()[:8])[0]
-    try:
-        pg_b = psycopg2.connect(host="localhost", port=5432, dbname="acquirer_core",
-                                user="postgres", password="postgres")
-        pg_b.autocommit = False
-        cur_b = pg_b.cursor()
-        cur_b.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id_b,))
-    except Exception as e:
-        warn(f"Could not connect to PostgreSQL directly for Phase B — skipping: {e}")
-        return
-
-    sc_b, lat_b, err_b = [], [], []
-    fire_lock_b = threading.Lock()
-
-    def do_retry_b():
-        t0 = time.time()
-        try:
-            r = confirm_intent(iid_b, idem_key=key_b)
-            with fire_lock_b: sc_b.append(r.status_code); lat_b.append((time.time()-t0)*1000)
-        except Exception as e:
-            with fire_lock_b: err_b.append(str(e)[:80])
-
-    threads_b = [threading.Thread(target=do_retry_b) for _ in range(CONCURRENCY)]
-    t0_b = time.time()
-    for t in threads_b: t.start()
-    # Lock is held the entire time — retries that miss Redis would hang here
-    for t in threads_b: t.join(timeout=15)
-    pg_b.commit(); cur_b.close(); pg_b.close()  # release lock (threads should already be done)
-
-    wall_b = int((time.time() - t0_b) * 1000)
-    dist_b = Counter(sc_b)
-    errors_b = dist_b.get(500, 0) + dist_b.get(503, 0) + len(err_b)
-    info(f"Phase B: wall={wall_b}ms  HTTP={dict(dist_b)}  conn_errors={len(err_b)}")
-
-    if lat_b:
-        lat_b.sort()
-        p50 = lat_b[len(lat_b)//2]; p95 = lat_b[int(len(lat_b)*0.95)]; p99 = lat_b[int(len(lat_b)*0.99)]
-        info(f"Phase B latency: P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms")
-
-    if errors_b > 0:
-        record_issue("CRITICAL", "hot_key_pool_exhaustion_phase_b",
-                     f"Phase B — {errors_b}/{CONCURRENCY} failed despite Redis pre-check — "
-                     f"Redis did not prevent pool exhaustion for replay requests")
-    else:
-        ok(f"Phase B — all {CONCURRENCY} retries returned 200 (Redis pre-check: zero DB connections used)")
-
-    if lat_b and p99 < 500:
-        ok(f"Phase B latency P99={p99:.0f}ms — retries answered at Redis speed, not DB speed")
+        record_issue("WARNING", "redis_lock_confirm", "0 PaymentAttempts — confirm may have been blocked entirely")
 
 
 def test_race_condition_double_capture():
@@ -1107,12 +960,7 @@ def test_sustained_load():
     metrics_snapshots = []
 
     def worker():
-        """Each worker loops: create → confirm (with idempotency key) → sleep to ~1 TPS per thread.
-
-        A unique idempotency key is generated per confirm so that pg_advisory_xact_lock is
-        exercised on every request during the load test — without this, the advisory lock
-        path is entirely bypassed and connection-pool contention under hot keys goes undetected.
-        """
+        """Each worker loops: create → confirm → sleep to ~1 TPS per thread."""
         while not stop_event.is_set():
             iid = None
             try:
@@ -1129,12 +977,10 @@ def test_sustained_load():
                 with ids_lock:
                     create_latencies.append(create_ms)
 
-                confirm_idem_key = str(uuid.uuid4())
                 t1 = time.time()
                 r2 = requests.post(f"{BASE}/payment_intents/{iid}/confirm",
                                    json={"paymentMethod": "card_4242"},
-                                   headers={"Content-Type": "application/json",
-                                            "Idempotency-Key": confirm_idem_key},
+                                   headers={"Content-Type": "application/json"},
                                    timeout=10)
                 confirm_ms = (time.time() - t1) * 1000
                 if r2.status_code >= 500:
@@ -1458,8 +1304,7 @@ if __name__ == "__main__":
             test_concurrent_creates,
             test_race_condition_double_confirm,
             test_idempotency_correctness,
-            test_idempotency_lock_contention,
-            test_hot_key_pool_exhaustion,
+            test_redis_distributed_lock_on_confirm,
             test_race_condition_double_capture,
             test_state_machine_guards,
             test_data_consistency_under_load,

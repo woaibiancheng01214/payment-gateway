@@ -5,19 +5,17 @@ import com.payment.gateway.dto.*
 import com.payment.gateway.entity.*
 import com.payment.gateway.repository.*
 import com.payment.gateway.util.HashUtils
-import jakarta.persistence.EntityManager
-import jakarta.persistence.PersistenceContext
 import org.slf4j.LoggerFactory
+import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.support.TransactionTemplate
-import java.nio.ByteBuffer
-import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 
 @Service
 class PaymentIntentService(
@@ -33,201 +31,220 @@ class PaymentIntentService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    @PersistenceContext
-    private lateinit var entityManager: EntityManager
-
     companion object {
-        private const val REDIS_PREFIX = "idempotency:"
-        private val REDIS_TTL = Duration.ofHours(24)
+        private const val IDEM_PREFIX = "idempotency:"
+        private const val LOCK_PREFIX = "lock:intent:"
+        private val IDEM_TTL = Duration.ofHours(24)
+        private val LOCK_TTL = Duration.ofSeconds(30)
     }
 
-    /**
-     * Redis pre-check for idempotency keys.
-     *
-     * Returns the cached JSON response string if the key is already known to Redis, or null on
-     * cache miss. Fails open — if Redis is unavailable the call returns null and the request
-     * falls through to the PostgreSQL advisory lock + DB lookup path as normal.
-     */
-    private fun redisGet(key: String): String? =
-        try { redisTemplate.opsForValue().get(REDIS_PREFIX + key) }
-        catch (e: Exception) { log.warn("Redis GET failed, falling through to DB: ${e.message}"); null }
+    // ── Redis idempotency cache (for create) ────────────────────────────────
 
     /**
-     * Writes the idempotency response to Redis after the DB transaction has committed.
-     * Fails open — a Redis write failure does not affect the response to the caller.
+     * Redis cache entry format: "requestHash\nresponseJson".
+     * The hash is stored alongside the response so a Redis hit can detect payload
+     * mismatches without falling through to the DB.
      */
-    private fun redisSet(key: String, value: String) =
-        try { redisTemplate.opsForValue().set(REDIS_PREFIX + key, value, REDIS_TTL) }
+    private fun redisGetIdem(key: String, requestHash: String): String? {
+        val raw = try { redisTemplate.opsForValue().get(IDEM_PREFIX + key) }
+                  catch (e: Exception) { log.warn("Redis GET failed, falling through to DB: ${e.message}"); return null }
+            ?: return null
+        val sep = raw.indexOf('\n')
+        if (sep < 0) return raw
+        val cachedHash = raw.substring(0, sep)
+        val cachedResponse = raw.substring(sep + 1)
+        if (cachedHash != requestHash) {
+            throw IllegalArgumentException(
+                "Idempotency key was already used with a different amount/currency"
+            )
+        }
+        return cachedResponse
+    }
+
+    private fun redisSetIdem(key: String, requestHash: String, responseJson: String) =
+        try { redisTemplate.opsForValue().set(IDEM_PREFIX + key, "$requestHash\n$responseJson", IDEM_TTL) }
         catch (e: Exception) { log.warn("Redis SET failed for idempotency key '$key': ${e.message}") }
 
+    // ── Redis distributed lock (for confirm/capture) ────────────────────────
+
     /**
-     * Acquires a PostgreSQL transaction-level advisory lock keyed on the idempotency key string.
-     *
-     * pg_advisory_xact_lock blocks until no other transaction holds the same lock, then grants
-     * it exclusively. The lock is automatically released when the transaction commits or rolls
-     * back — no manual cleanup required. Because the lock lives inside PostgreSQL (not the JVM),
-     * it works across every application instance connected to the same database.
-     *
-     * This is the fallback path — only reached on a Redis cache miss.
-     * Lock ID is derived from the first 8 bytes of SHA-256(key), giving a 64-bit integer with
-     * negligible collision probability (~1 in 2^64).
+     * Acquires a Redis distributed lock using SET NX EX.
+     * Returns the lock value (UUID) on success, null if the lock is already held.
      */
-    private fun acquireIdempotencyLock(key: String) {
-        val lockId = ByteBuffer.wrap(
-            MessageDigest.getInstance("SHA-256").digest(key.toByteArray())
-        ).long
-        entityManager.createNativeQuery("SELECT pg_advisory_xact_lock(:id)")
-            .setParameter("id", lockId)
-            .singleResult
-        log.debug("Advisory lock acquired for idempotency key '$key' (lockId=$lockId)")
+    private fun acquireRedisLock(intentId: String): String? {
+        val lockValue = UUID.randomUUID().toString()
+        val acquired = try {
+            redisTemplate.opsForValue()
+                .setIfAbsent(LOCK_PREFIX + intentId, lockValue, LOCK_TTL)
+                ?: false
+        } catch (e: Exception) {
+            log.warn("Redis lock acquire failed for intent $intentId, proceeding without lock: ${e.message}")
+            return lockValue
+        }
+        return if (acquired) lockValue else null
     }
 
+    /**
+     * Releases a Redis distributed lock only if it's still owned by this holder.
+     * Uses a Lua script for atomic check-and-delete to avoid releasing another holder's lock.
+     */
+    private fun releaseRedisLock(intentId: String, lockValue: String) {
+        try {
+            val script = "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end"
+            redisTemplate.execute(
+                org.springframework.data.redis.core.script.DefaultRedisScript(script, Long::class.java),
+                listOf(LOCK_PREFIX + intentId),
+                lockValue
+            )
+        } catch (e: Exception) {
+            log.warn("Redis lock release failed for intent $intentId: ${e.message}")
+        }
+    }
+
+    // ── Create ──────────────────────────────────────────────────────────────
+
+    /**
+     * Creates a PaymentIntent with optional idempotency key.
+     *
+     * Flow:
+     * 1. Redis pre-check: if the key is cached, return immediately (zero DB cost).
+     * 2. On cache miss: insert IdempotencyKey row optimistically (unique constraint on PK).
+     *    - If insert succeeds → this is the first request, create the PaymentIntent normally.
+     *    - If DataIntegrityViolationException → a concurrent request won the race,
+     *      read the winner's response from the IdempotencyKey table and return it.
+     * 3. After commit, write the response to Redis so subsequent retries hit the cache.
+     *
+     * No advisory locks, no distributed locks — the DB unique constraint serialises the race.
+     */
     fun createPaymentIntent(
         request: CreatePaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
-        // Redis pre-check — short-circuits before acquiring any DB connection.
-        // On a cache hit the advisory lock and DB lookup are skipped entirely,
-        // preventing Hikari pool exhaustion under hot-key retry storms.
-        if (idempotencyKey != null) {
-            redisGet(idempotencyKey)?.let {
+        val requestHash = if (idempotencyKey != null) {
+            HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
+        } else null
+
+        if (idempotencyKey != null && requestHash != null) {
+            redisGetIdem(idempotencyKey, requestHash)?.let {
                 log.info("Redis HIT for idempotency key '$idempotencyKey' (create)")
                 return objectMapper.readValue(it, PaymentIntentResponse::class.java)
             }
         }
 
-        val response = transactionTemplate.execute {
-            val requestHash = if (idempotencyKey != null) {
-                acquireIdempotencyLock(idempotencyKey)
-                val hash = HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
-                val existing = idempotencyKeyRepository.findById(idempotencyKey)
-                if (existing.isPresent) {
-                    if (existing.get().requestHash != hash) {
-                        throw IllegalArgumentException(
-                            "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
-                        )
+        val response: PaymentIntentResponse = try {
+            transactionTemplate.execute {
+                if (idempotencyKey != null) {
+                    val existing = idempotencyKeyRepository.findById(idempotencyKey)
+                    if (existing.isPresent) {
+                        if (existing.get().requestHash != requestHash) {
+                            throw IllegalArgumentException(
+                                "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
+                            )
+                        }
+                        log.info("DB HIT for idempotency key '$idempotencyKey' (create)")
+                        return@execute objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
                     }
-                    log.info("Returning cached create response for idempotency key $idempotencyKey")
-                    return@execute objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
                 }
-                hash
-            } else null
 
-            val intent = PaymentIntent(
-                amount = request.amount,
-                currency = request.currency.uppercase(),
-                status = PaymentIntentStatus.REQUIRES_CONFIRMATION
-            )
-            paymentIntentRepository.save(intent)
-            val resp = intent.toResponse()
+                val intent = PaymentIntent(
+                    amount = request.amount,
+                    currency = request.currency.uppercase(),
+                    status = PaymentIntentStatus.REQUIRES_CONFIRMATION
+                )
+                paymentIntentRepository.save(intent)
+                val resp = intent.toResponse()
 
-            if (idempotencyKey != null) {
-                idempotencyKeyRepository.save(
-                    IdempotencyKey(
-                        key = idempotencyKey,
-                        requestHash = requestHash!!,
-                        response = objectMapper.writeValueAsString(resp)
+                if (idempotencyKey != null) {
+                    idempotencyKeyRepository.save(
+                        IdempotencyKey(
+                            key = idempotencyKey,
+                            requestHash = requestHash!!,
+                            response = objectMapper.writeValueAsString(resp)
+                        )
                     )
+                }
+                resp
+            }!!
+        } catch (e: DataIntegrityViolationException) {
+            if (idempotencyKey == null) throw e
+            log.info("Concurrent create race on idempotency key '$idempotencyKey' — reading winner's response")
+            val winner = idempotencyKeyRepository.findById(idempotencyKey)
+                .orElseThrow { e }
+            if (winner.requestHash != requestHash) {
+                throw IllegalArgumentException(
+                    "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
                 )
             }
-            resp
-        }!!
+            objectMapper.readValue(winner.response, PaymentIntentResponse::class.java)
+        }
 
-        // Write to Redis after transaction commits so cache is only populated on success.
-        if (idempotencyKey != null) {
-            redisSet(idempotencyKey, objectMapper.writeValueAsString(response))
+        if (idempotencyKey != null && requestHash != null) {
+            redisSetIdem(idempotencyKey, requestHash, objectMapper.writeValueAsString(response))
         }
         return response
     }
 
+    // ── Confirm ─────────────────────────────────────────────────────────────
+
+    /**
+     * Confirms a PaymentIntent, creating a PaymentAttempt + auth InternalAttempt.
+     *
+     * Concurrency is controlled by a Redis distributed lock on the intentId:
+     * - SET NX EX ensures only one confirm is processed at a time across all app instances.
+     * - If the lock is already held, return 409 immediately (no DB connection consumed).
+     * - findByIdForUpdate remains as a DB-level safety net inside the transaction.
+     *
+     * No idempotency key needed — the lock is on the resource (intentId) itself.
+     */
     fun confirmPaymentIntent(
         intentId: String,
-        request: ConfirmPaymentIntentRequest,
-        idempotencyKey: String?
+        request: ConfirmPaymentIntentRequest
     ): PaymentIntentResponse {
-        // Redis pre-check — short-circuits before acquiring any DB connection.
-        if (idempotencyKey != null) {
-            redisGet(idempotencyKey)?.let {
-                log.info("Redis HIT for idempotency key '$idempotencyKey' (confirm)")
-                return objectMapper.readValue(it, PaymentIntentResponse::class.java)
-            }
-        }
+        val lockValue = acquireRedisLock(intentId)
+            ?: throw IllegalStateException("Another confirm is already in progress for PaymentIntent $intentId")
 
-        val (response, attemptToDispatch) = transactionTemplate.execute {
-            // Acquire advisory lock first (before the row lock) so concurrent confirms
-            // for the same idempotency key are serialised at the DB level. This prevents
-            // two threads from both passing the idempotency check, both seeing no existing
-            // attempt, and both creating a PaymentAttempt for the same intent.
-            if (idempotencyKey != null) {
-                acquireIdempotencyLock(idempotencyKey)
-            }
+        try {
+            val (response, attemptToDispatch) = transactionTemplate.execute {
+                val intent = paymentIntentRepository.findByIdForUpdate(intentId)
+                    .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
-            val intent = paymentIntentRepository.findByIdForUpdate(intentId)
-                .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
-
-            if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) {
-                throw IllegalStateException("PaymentIntent is not in requires_confirmation state")
-            }
-
-            if (idempotencyKey != null) {
-                val requestHash = HashUtils.sha256(intentId + request.paymentMethod)
-                val existing = idempotencyKeyRepository.findById(idempotencyKey)
-                if (existing.isPresent) {
-                    if (existing.get().requestHash != requestHash) {
-                        throw IllegalArgumentException("Idempotency key reused with different request payload")
-                    }
-                    log.info("Returning cached idempotency response for key $idempotencyKey")
-                    return@execute Pair(objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java), null)
+                if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) {
+                    throw IllegalStateException("PaymentIntent is not in requires_confirmation state")
                 }
-            }
 
-            val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
-            if (existingAttempt != null) {
-                log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
-                return@execute Pair(intent.toResponse(), null)
-            }
+                val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
+                if (existingAttempt != null) {
+                    log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
+                    return@execute Pair(intent.toResponse(), null)
+                }
 
-            val attempt = PaymentAttempt(
-                paymentIntentId = intentId,
-                paymentMethod = request.paymentMethod,
-                status = PaymentAttemptStatus.PENDING
-            )
-            paymentAttemptRepository.save(attempt)
-
-            val internalAttempt = InternalAttempt(
-                paymentAttemptId = attempt.id,
-                type = InternalAttemptType.AUTH,
-                requestPayload = objectMapper.writeValueAsString(
-                    mapOf("paymentMethod" to request.paymentMethod, "amount" to intent.amount, "currency" to intent.currency)
+                val attempt = PaymentAttempt(
+                    paymentIntentId = intentId,
+                    paymentMethod = request.paymentMethod,
+                    status = PaymentAttemptStatus.PENDING
                 )
-            )
-            internalAttemptRepository.save(internalAttempt)
+                paymentAttemptRepository.save(attempt)
 
-            val resp = intent.toResponse()
-
-            if (idempotencyKey != null) {
-                val requestHash = HashUtils.sha256(intentId + request.paymentMethod)
-                idempotencyKeyRepository.save(
-                    IdempotencyKey(
-                        key = idempotencyKey,
-                        requestHash = requestHash,
-                        response = objectMapper.writeValueAsString(resp)
+                val internalAttempt = InternalAttempt(
+                    paymentAttemptId = attempt.id,
+                    type = InternalAttemptType.AUTH,
+                    requestPayload = objectMapper.writeValueAsString(
+                        mapOf("paymentMethod" to request.paymentMethod, "amount" to intent.amount, "currency" to intent.currency)
                     )
                 )
-            }
+                internalAttemptRepository.save(internalAttempt)
 
-            Pair(resp, internalAttempt as InternalAttempt?)
-        }!!
+                Pair(intent.toResponse(), internalAttempt as InternalAttempt?)
+            }!!
 
-        // Write to Redis after transaction commits (fail-open: Redis is cache, DB is source of truth)
-        if (idempotencyKey != null) {
-            redisSet(idempotencyKey, objectMapper.writeValueAsString(response))
+            dispatchBestEffort(attemptToDispatch)
+            return response
+        } finally {
+            releaseRedisLock(intentId, lockValue)
         }
-
-        // Transaction committed, DB connection released — safe to block on gateway
-        dispatchBestEffort(attemptToDispatch)
-        return response
     }
+
+    // ── Capture ─────────────────────────────────────────────────────────────
 
     fun capturePaymentIntent(intentId: String): PaymentIntentResponse {
         val (response, attemptToDispatch) = transactionTemplate.execute {
@@ -267,6 +284,8 @@ class PaymentIntentService(
         return response
     }
 
+    // ── Gateway dispatch ────────────────────────────────────────────────────
+
     private fun dispatchBestEffort(internalAttempt: InternalAttempt?) {
         if (internalAttempt == null) return
         try {
@@ -277,26 +296,18 @@ class PaymentIntentService(
         }
     }
 
+    // ── Webhook handling ────────────────────────────────────────────────────
+
     @Transactional
     fun handleWebhook(internalAttemptId: String, gatewayStatus: String) {
-        // --- Phase 1: navigate to the PaymentIntent ID without any lock ---
-        // We read InternalAttempt and PaymentAttempt here only to discover the
-        // paymentIntentId; actual business logic happens after we hold the lock.
         val probe = internalAttemptRepository.findById(internalAttemptId)
             .orElseThrow { IllegalArgumentException("InternalAttempt $internalAttemptId not found") }
         val probedAttempt = paymentAttemptRepository.findById(probe.paymentAttemptId)
             .orElseThrow { IllegalStateException("PaymentAttempt not found for InternalAttempt $internalAttemptId") }
 
-        // --- Phase 2: acquire the aggregate-root write lock (same order as confirm/capture) ---
-        // All writers (confirm, capture, webhook, expiry scheduler) must hold this lock before
-        // mutating any entity in this intent's tree, preventing refund/cancel from racing against
-        // an in-flight capture or auth webhook.
         val intent = paymentIntentRepository.findByIdForUpdate(probedAttempt.paymentIntentId)
             .orElseThrow { IllegalStateException("PaymentIntent not found") }
 
-        // --- Phase 3: re-read InternalAttempt under the lock ---
-        // The expiry scheduler runs in REQUIRES_NEW transactions and may have marked this attempt
-        // EXPIRED between our initial read (phase 1) and lock acquisition (phase 2).
         val internalAttempt = internalAttemptRepository.findById(internalAttemptId)
             .orElseThrow { IllegalArgumentException("InternalAttempt $internalAttemptId not found") }
 
@@ -384,16 +395,15 @@ class PaymentIntentService(
                 log.info("PaymentIntent ${intent.id} captured")
             }
             InternalAttemptStatus.FAILURE -> {
-                // Capture failed — intent stays AUTHORIZED so the merchant can retry capture.
-                // No state change; the InternalAttempt already records the failure above.
                 log.warn("Capture failed for PaymentIntent ${intent.id} — still authorized, retry is possible")
             }
             else -> {
-                // TIMEOUT handled by retry logic in MockGatewayService
                 log.info("Capture webhook with status $status for ${intent.id} — retry pending")
             }
         }
     }
+
+    // ── Reads ───────────────────────────────────────────────────────────────
 
     fun getPaymentIntentDetail(intentId: String): PaymentIntentDetailResponse {
         val intent = paymentIntentRepository.findById(intentId)
