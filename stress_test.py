@@ -261,6 +261,212 @@ def test_idempotency_correctness():
         record_issue("CRITICAL", "idempotency", f"Concurrent replays returned inconsistent results: {set(replay_results)}")
 
 
+def test_idempotency_lock_contention():
+    """
+    Fire CONCURRENCY concurrent confirms on the SAME intent with the SAME idempotency key.
+
+    Validates two things:
+    1. Correctness — pg_advisory_xact_lock serialises the concurrent requests so only
+       one PaymentAttempt is created and every caller receives the same cached response.
+    2. Connection pool behaviour — all CONCURRENCY threads hold a Hikari connection while
+       waiting on the advisory lock. With maximum-pool-size=50 and CONCURRENCY=60 some
+       threads will wait in the Hikari queue while others block in Postgres.
+
+    P99 latency here directly reflects advisory-lock wait time: if threads queue up,
+    the last thread to acquire the lock waits for all (CONCURRENCY-1) predecessors to
+    commit before it gets the lock and can return the cached response.
+    """
+    CONCURRENCY = 60
+    print(f"\n{BOLD}── Test 4b: Idempotency Lock Contention ({CONCURRENCY} concurrent confirms, same key) ──{RESET}")
+    intent = create_intent()
+    iid = intent["id"]
+    key = str(uuid.uuid4())
+
+    status_codes = []
+    intent_ids = []
+    latencies = []
+    errors = []
+
+    def do_confirm():
+        t0 = time.time()
+        try:
+            r = confirm_intent(iid, idem_key=key)
+            ms = (time.time() - t0) * 1000
+            with LOCK:
+                status_codes.append(r.status_code)
+                latencies.append(ms)
+                if r.status_code == 200:
+                    intent_ids.append(r.json().get("id"))
+        except Exception as e:
+            with LOCK:
+                errors.append(str(e)[:80])
+
+    threads = [threading.Thread(target=do_confirm) for _ in range(CONCURRENCY)]
+    t_start = time.time()
+    for t in threads: t.start()
+    for t in threads: t.join()
+    total_ms = (time.time() - t_start) * 1000
+
+    if latencies:
+        latencies.sort()
+        p50 = latencies[len(latencies) // 2]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        p99 = latencies[int(len(latencies) * 0.99)]
+        info(f"P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms  wall={total_ms:.0f}ms")
+
+    status_dist = Counter(status_codes)
+    info(f"HTTP status distribution: {dict(status_dist)}")
+
+    if errors:
+        record_issue("CRITICAL", "idem_lock_contention",
+                     f"{len(errors)} connection/timeout errors — likely pool exhaustion: {errors[:2]}")
+    else:
+        ok(f"No connection errors under {CONCURRENCY}-thread advisory lock contention")
+
+    time.sleep(3)
+    detail = get_intent(iid)
+    attempt_count = len(detail.get("attempts", []))
+    if attempt_count > 1:
+        record_issue("CRITICAL", "idem_lock_contention",
+                     f"{attempt_count} PaymentAttempts created — advisory lock did not serialise correctly")
+    else:
+        ok(f"Only 1 PaymentAttempt created despite {CONCURRENCY} concurrent confirms")
+
+    unique_ids = set(intent_ids)
+    if len(unique_ids) > 1:
+        record_issue("CRITICAL", "idem_lock_contention",
+                     f"Concurrent confirms returned {len(unique_ids)} different intent IDs: {unique_ids}")
+    elif intent_ids:
+        ok(f"All {len(intent_ids)} successful confirms returned the same intent ID")
+
+    if p99 > 2000 if latencies else False:
+        record_issue("WARNING", "idem_lock_contention",
+                     f"P99 advisory lock wait {p99:.0f}ms — consider pg_try_advisory_xact_lock + 409 retry")
+
+
+def test_hot_key_pool_exhaustion():
+    """
+    Deliberately triggers Hikari connection pool exhaustion via a hot idempotency key.
+
+    Technique: use psycopg2 to hold the PostgreSQL advisory lock directly from the test
+    process for HOLD_S seconds, then fire CONCURRENCY HTTP confirms with the same key
+    while the lock is held.
+
+    What happens:
+    - All CONCURRENCY threads start a Spring transaction and call pg_advisory_xact_lock.
+    - pg_advisory_xact_lock blocks inside Postgres — each blocked thread holds a Hikari
+      connection while waiting.
+    - CONCURRENCY (80) > maximum-pool-size (50): the 30 excess threads cannot get a
+      Hikari connection at all and will wait in the pool queue.
+    - If the lock is held longer than connection-timeout (5s), those 30 threads fail with
+      a HikariPool timeout → the server returns 500.
+
+    This is the exact failure mode that occurs during a client retry storm on a hot key
+    while the backend is under load (slow transactions).
+
+    Requires psycopg2-binary: pip install psycopg2-binary
+    """
+    try:
+        import psycopg2
+        import hashlib
+        import struct
+    except ImportError:
+        warn("psycopg2 not installed — skipping pool exhaustion test (pip install psycopg2-binary)")
+        return
+
+    CONCURRENCY = 80          # > maximum-pool-size=50, so 30 threads queue for connections
+    HOLD_S      = 8           # hold the advisory lock longer than connection-timeout=5s
+
+    print(f"\n{BOLD}── Test 4c: Hot-Key Pool Exhaustion (psycopg2 lock holder, {CONCURRENCY} concurrent confirms) ──{RESET}")
+
+    # Create intent and derive the same lock ID the backend would compute:
+    # SHA-256(key) → first 8 bytes → big-endian signed int64
+    intent = create_intent()
+    iid = intent["id"]
+    key = str(uuid.uuid4())
+    lock_id = struct.unpack(">q", hashlib.sha256(key.encode()).digest()[:8])[0]
+
+    info(f"Holding advisory lock {lock_id} for {HOLD_S}s while {CONCURRENCY} confirms queue...")
+
+    # Open a direct DB connection and acquire the advisory lock
+    try:
+        pg = psycopg2.connect(
+            host="localhost", port=5432, dbname="acquirer_core",
+            user="postgres", password="postgres"
+        )
+        pg.autocommit = False
+        cur = pg.cursor()
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+    except Exception as e:
+        warn(f"Could not connect to PostgreSQL directly — skipping: {e}")
+        return
+
+    # Fire CONCURRENCY confirms while the lock is held
+    status_codes = []
+    latencies    = []
+    conn_errors  = []
+    fire_lock    = threading.Lock()
+
+    def do_confirm():
+        t0 = time.time()
+        try:
+            r = confirm_intent(iid, idem_key=key)
+            ms = (time.time() - t0) * 1000
+            with fire_lock:
+                status_codes.append(r.status_code)
+                latencies.append(ms)
+        except Exception as e:
+            with fire_lock:
+                conn_errors.append(str(e)[:80])
+
+    threads = [threading.Thread(target=do_confirm) for _ in range(CONCURRENCY)]
+    t_fire = time.time()
+    for t in threads:
+        t.start()
+
+    # Hold the lock, letting threads queue up, then release
+    time.sleep(HOLD_S)
+    pg.commit()   # releases advisory lock
+    cur.close()
+    pg.close()
+    info(f"Advisory lock released after {HOLD_S}s — waiting for threads to drain...")
+
+    for t in threads:
+        t.join(timeout=20)
+
+    wall_ms = (time.time() - t_fire) * 1000
+    status_dist = Counter(status_codes)
+    info(f"Wall time: {wall_ms:.0f}ms  HTTP distribution: {dict(status_dist)}  conn_errors: {len(conn_errors)}")
+
+    if latencies:
+        latencies.sort()
+        p50 = latencies[len(latencies) // 2]
+        p95 = latencies[int(len(latencies) * 0.95)]
+        p99 = latencies[int(len(latencies) * 0.99)]
+        info(f"P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms")
+
+    server_errors = status_dist.get(500, 0) + status_dist.get(503, 0) + len(conn_errors)
+    if server_errors > 0:
+        record_issue(
+            "WARNING", "hot_key_pool_exhaustion",
+            f"{server_errors}/{CONCURRENCY} requests failed (Hikari pool timeout) — "
+            f"demonstrates connection pool exhaustion under hot-key lock contention. "
+            f"Fix: pg_try_advisory_xact_lock + 409 retry, or Redis pre-check."
+        )
+    else:
+        ok(f"No pool exhaustion errors (all {CONCURRENCY} requests completed)")
+
+    # Correctness: still only 1 PaymentAttempt should exist
+    time.sleep(2)
+    detail = get_intent(iid)
+    attempt_count = len(detail.get("attempts", []))
+    if attempt_count > 1:
+        record_issue("CRITICAL", "hot_key_pool_exhaustion",
+                     f"{attempt_count} PaymentAttempts created — advisory lock did not serialise")
+    else:
+        ok(f"Exactly 1 PaymentAttempt created despite {CONCURRENCY} concurrent confirms")
+
+
 def test_race_condition_double_capture():
     """Fire 10 concurrent captures on an authorized intent — only 1 should succeed."""
     print(f"\n{BOLD}── Test 5: Race Condition — Concurrent Captures ──{RESET}")
@@ -873,7 +1079,12 @@ def test_sustained_load():
     metrics_snapshots = []
 
     def worker():
-        """Each worker loops: create → confirm → sleep to ~1 TPS per thread."""
+        """Each worker loops: create → confirm (with idempotency key) → sleep to ~1 TPS per thread.
+
+        A unique idempotency key is generated per confirm so that pg_advisory_xact_lock is
+        exercised on every request during the load test — without this, the advisory lock
+        path is entirely bypassed and connection-pool contention under hot keys goes undetected.
+        """
         while not stop_event.is_set():
             iid = None
             try:
@@ -890,9 +1101,13 @@ def test_sustained_load():
                 with ids_lock:
                     create_latencies.append(create_ms)
 
+                confirm_idem_key = str(uuid.uuid4())
                 t1 = time.time()
                 r2 = requests.post(f"{BASE}/payment_intents/{iid}/confirm",
-                                   json={"paymentMethod": "card_4242"}, timeout=10)
+                                   json={"paymentMethod": "card_4242"},
+                                   headers={"Content-Type": "application/json",
+                                            "Idempotency-Key": confirm_idem_key},
+                                   timeout=10)
                 confirm_ms = (time.time() - t1) * 1000
                 if r2.status_code >= 500:
                     with ids_lock:
@@ -1215,6 +1430,8 @@ if __name__ == "__main__":
             test_concurrent_creates,
             test_race_condition_double_confirm,
             test_idempotency_correctness,
+            test_idempotency_lock_contention,
+            test_hot_key_pool_exhaustion,
             test_race_condition_double_capture,
             test_state_machine_guards,
             test_data_consistency_under_load,

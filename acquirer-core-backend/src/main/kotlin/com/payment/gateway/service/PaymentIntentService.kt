@@ -101,6 +101,14 @@ class PaymentIntentService(
         idempotencyKey: String?
     ): PaymentIntentResponse {
         val (response, attemptToDispatch) = transactionTemplate.execute {
+            // Acquire advisory lock first (before the row lock) so concurrent confirms
+            // for the same idempotency key are serialised at the DB level. This prevents
+            // two threads from both passing the idempotency check, both seeing no existing
+            // attempt, and both creating a PaymentAttempt for the same intent.
+            if (idempotencyKey != null) {
+                acquireIdempotencyLock(idempotencyKey)
+            }
+
             val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                 .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 

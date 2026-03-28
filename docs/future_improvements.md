@@ -225,6 +225,21 @@ Redis GET idempotency:<key>
                        └── on completion: SET Redis idempotency:<key> EX 86400
 ```
 
+**Known gap — connection pool exhaustion under lock contention:** `pg_advisory_xact_lock`
+is a blocking call — the calling thread and its Hikari connection are both held for the
+entire duration of the lock wait. Under high concurrency on a hot idempotency key,
+waiting threads exhaust the connection pool (`maximum-pool-size=50`) before the Redis
+pre-check is ever needed. The short-term mitigation (without Redis) is to switch to
+`pg_try_advisory_xact_lock` (non-blocking — returns `false` immediately if the lock is
+taken) and respond with HTTP 409 so the caller can retry, rather than blocking a
+connection indefinitely.
+
+**Note — load test blind spot:** The sustained load test in `stress_test.py` does not
+exercise this path because `worker()` never passes an idempotency key to `confirm_intent`.
+To expose the bottleneck, the test would need to send concurrent confirms for the same
+intent using the same idempotency key, reduce `maximum-pool-size` below the thread count,
+and ramp beyond 500 TPS.
+
 **Lower priority now** because advisory locks handle correctness. Redis is a performance
 optimization for when DB connection pool saturation becomes a bottleneck.
 
@@ -317,4 +332,4 @@ new `PaymentIntent` transitions.
 | 5 | 3DS2 authentication | TODO | High | Liability shift, regulatory non-compliance in EU |
 | 11 | Incremental auth / partial capture | TODO | High | Missing for hospitality/marketplace use cases |
 | 4 | Durable queue (Kafka/SQS) | Deferred | High | Kafka is deployed; migration is infrastructure-ready |
-| 8 | Redis idempotency pre-check | Deferred | Low | Performance-only (advisory locks handle correctness) |
+| 8 | Redis idempotency pre-check | Deferred | Low | Connection pool exhaustion under hot-key contention; load test does not cover this path |
