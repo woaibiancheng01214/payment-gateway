@@ -1,0 +1,24 @@
+{
+  "name": "payment-gateway-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "postgres",
+    "database.password": "postgres",
+    "database.dbname": "payment_gateway",
+    "database.server.name": "payment-gateway",
+    "topic.prefix": "payment-gateway",
+    "table.include.list": "public.payment_intents",
+    "plugin.name": "pgoutput",
+    "publication.autocreate.mode": "filtered",
+    "slot.name": "payment_gateway_slot",
+    "heartbeat.interval.ms": "10000",
+    "snapshot.mode": "initial",
+    "tombstones.on.delete": "false",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
