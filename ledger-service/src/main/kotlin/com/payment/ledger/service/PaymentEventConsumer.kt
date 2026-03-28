@@ -1,26 +1,36 @@
 package com.payment.ledger.service
 
-import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.stereotype.Service
 import java.time.Instant
 
-/**
- * Consumes Debezium CDC events from the payment_intents table.
- *
- * Debezium envelope format:
- * {
- *   "before": { "id": "...", "status": "REQUIRES_CONFIRMATION", ... } | null,
- *   "after":  { "id": "...", "status": "AUTHORIZED", ... } | null,
- *   "op": "c" | "u" | "d" | "r",
- *   "ts_ms": 1234567890
- * }
- *
- * We only care about updates (op=u) where the status field changes to a
- * financially meaningful state (AUTHORIZED, CAPTURED, FAILED, EXPIRED).
- */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class PaymentIntentSnapshot(
+    val id: String,
+    val amount: Long,
+    val currency: String,
+    val status: String
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class DebeziumEnvelope(
+    val before: PaymentIntentSnapshot? = null,
+    val after: PaymentIntentSnapshot? = null,
+    val op: String? = null,
+    @JsonProperty("ts_ms")
+    val tsMs: Long? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class DebeziumMessage(
+    val payload: DebeziumEnvelope? = null
+)
+
 @Service
 class PaymentEventConsumer(
     private val ledgerService: LedgerService,
@@ -31,30 +41,27 @@ class PaymentEventConsumer(
     @KafkaListener(topics = ["\${ledger.kafka.topic:payment-gateway.public.payment_intents}"])
     fun consume(message: String) {
         try {
-            val root = objectMapper.readTree(message)
-
-            val payload = if (root.has("payload")) root["payload"] else root
-            val op = payload["op"]?.asText() ?: return
+            val envelope = parseEnvelope(message) ?: return
+            val op = envelope.op ?: return
             if (op != "u" && op != "c") return
 
-            val after = payload["after"] ?: return
-            val before = payload["before"]
+            val after = envelope.after ?: return
+            val oldStatus = envelope.before?.status
+            val eventTimestamp = Instant.ofEpochMilli(envelope.tsMs ?: System.currentTimeMillis())
 
-            val intentId = extractString(after, "id") ?: return
-            val newStatus = extractString(after, "status") ?: return
-            val oldStatus = if (before != null && !before.isNull) extractString(before, "status") else null
-            val amount = extractLong(after, "amount") ?: return
-            val currency = extractString(after, "currency") ?: return
-            val tsMs = payload["ts_ms"]?.asLong() ?: System.currentTimeMillis()
-            val eventTimestamp = Instant.ofEpochMilli(tsMs)
+            if (oldStatus == after.status) return
 
-            if (oldStatus == newStatus) return
-
-            log.info("CDC event: intent=$intentId, $oldStatus -> $newStatus")
-            processTransition(intentId, oldStatus, newStatus, amount, currency, eventTimestamp)
+            log.info("CDC event: intent=${after.id}, $oldStatus -> ${after.status}")
+            processTransition(after.id, oldStatus, after.status, after.amount, after.currency, eventTimestamp)
         } catch (e: Exception) {
             log.error("Failed to process CDC event: ${e.message}", e)
         }
+    }
+
+    private fun parseEnvelope(message: String): DebeziumEnvelope? {
+        val wrapped = objectMapper.readValue<DebeziumMessage>(message)
+        if (wrapped.payload != null) return wrapped.payload
+        return objectMapper.readValue<DebeziumEnvelope>(message)
     }
 
     private fun processTransition(
@@ -129,10 +136,4 @@ class PaymentEventConsumer(
             else -> log.debug("Ignoring transition to $newStatus for $intentId")
         }
     }
-
-    private fun extractString(node: JsonNode, field: String): String? =
-        node[field]?.asText()
-
-    private fun extractLong(node: JsonNode, field: String): Long? =
-        if (node.has(field) && !node[field].isNull) node[field].asLong() else null
 }
