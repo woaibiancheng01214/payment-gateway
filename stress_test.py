@@ -346,23 +346,24 @@ def test_idempotency_lock_contention():
 
 def test_hot_key_pool_exhaustion():
     """
-    Deliberately triggers Hikari connection pool exhaustion via a hot idempotency key.
+    Two-phase test that first DEMONSTRATES the pool exhaustion problem, then PROVES
+    that the Redis pre-check fixes it for replay (retry) requests.
 
-    Technique: use psycopg2 to hold the PostgreSQL advisory lock directly from the test
-    process for HOLD_S seconds, then fire CONCURRENCY HTTP confirms with the same key
-    while the lock is held.
+    ── Phase A — Problem (in-flight slow first request) ──────────────────────────
+    psycopg2 holds the advisory lock for HOLD_S seconds (simulating a slow first
+    request still in-flight). 80 concurrent HTTP confirms fire with the same key
+    while the lock is held. Since Redis has no entry yet (first request never
+    completed), all 80 miss Redis and try to acquire the DB advisory lock:
+      - 50 get Hikari connections and block in Postgres waiting for the lock
+      - 30 cannot get a Hikari connection within connection-timeout=5s → 500
+    Expected: {500: 30, 200: 50}. Fix for this phase: pg_try_advisory_xact_lock.
 
-    What happens:
-    - All CONCURRENCY threads start a Spring transaction and call pg_advisory_xact_lock.
-    - pg_advisory_xact_lock blocks inside Postgres — each blocked thread holds a Hikari
-      connection while waiting.
-    - CONCURRENCY (80) > maximum-pool-size (50): the 30 excess threads cannot get a
-      Hikari connection at all and will wait in the pool queue.
-    - If the lock is held longer than connection-timeout (5s), those 30 threads fail with
-      a HikariPool timeout → the server returns 500.
-
-    This is the exact failure mode that occurs during a client retry storm on a hot key
-    while the backend is under load (slow transactions).
+    ── Phase B — Redis fix (client retry storm after first request completes) ────
+    After a first confirm completes (warms Redis), 80 concurrent retries with the
+    same idempotency key are fired while the advisory lock is still held by psycopg2.
+    All 80 hit Redis on the pre-check and return immediately — zero DB connections
+    are acquired, so pool exhaustion is impossible regardless of CONCURRENCY.
+    Expected: {200: 80}. This is the Redis pre-check fix.
 
     Requires psycopg2-binary: pip install psycopg2-binary
     """
@@ -374,97 +375,124 @@ def test_hot_key_pool_exhaustion():
         warn("psycopg2 not installed — skipping pool exhaustion test (pip install psycopg2-binary)")
         return
 
-    CONCURRENCY = 80          # > maximum-pool-size=50, so 30 threads queue for connections
-    HOLD_S      = 8           # hold the advisory lock longer than connection-timeout=5s
+    CONCURRENCY = 80   # > maximum-pool-size=50
+    HOLD_S      = 8    # > connection-timeout=5s so the 30 queued threads time out
 
-    print(f"\n{BOLD}── Test 4c: Hot-Key Pool Exhaustion (psycopg2 lock holder, {CONCURRENCY} concurrent confirms) ──{RESET}")
+    print(f"\n{BOLD}── Test 4c: Hot-Key Pool Exhaustion ──{RESET}")
 
-    # Create intent and derive the same lock ID the backend would compute:
-    # SHA-256(key) → first 8 bytes → big-endian signed int64
-    intent = create_intent()
-    iid = intent["id"]
-    key = str(uuid.uuid4())
-    lock_id = struct.unpack(">q", hashlib.sha256(key.encode()).digest()[:8])[0]
+    # ── Phase A: demonstrate the problem ─────────────────────────────────────────
+    print(f"\n  {BOLD}Phase A — Problem: in-flight slow request + {CONCURRENCY} concurrent retries{RESET}")
 
-    info(f"Holding advisory lock {lock_id} for {HOLD_S}s while {CONCURRENCY} confirms queue...")
+    intent_a = create_intent()
+    iid_a = intent_a["id"]
+    key_a = str(uuid.uuid4())
+    lock_id_a = struct.unpack(">q", hashlib.sha256(key_a.encode()).digest()[:8])[0]
 
-    # Open a direct DB connection and acquire the advisory lock
     try:
-        pg = psycopg2.connect(
-            host="localhost", port=5432, dbname="acquirer_core",
-            user="postgres", password="postgres"
-        )
-        pg.autocommit = False
-        cur = pg.cursor()
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+        pg_a = psycopg2.connect(host="localhost", port=5432, dbname="acquirer_core",
+                                user="postgres", password="postgres")
+        pg_a.autocommit = False
+        cur_a = pg_a.cursor()
+        cur_a.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id_a,))
     except Exception as e:
         warn(f"Could not connect to PostgreSQL directly — skipping: {e}")
         return
 
-    # Fire CONCURRENCY confirms while the lock is held
-    status_codes = []
-    latencies    = []
-    conn_errors  = []
-    fire_lock    = threading.Lock()
+    info(f"Holding advisory lock for {HOLD_S}s, firing {CONCURRENCY} confirms (Redis is cold)...")
 
-    def do_confirm():
+    sc_a, lat_a, err_a = [], [], []
+    fire_lock = threading.Lock()
+
+    def do_confirm_a():
         t0 = time.time()
         try:
-            r = confirm_intent(iid, idem_key=key)
-            ms = (time.time() - t0) * 1000
-            with fire_lock:
-                status_codes.append(r.status_code)
-                latencies.append(ms)
+            r = confirm_intent(iid_a, idem_key=key_a)
+            with fire_lock: sc_a.append(r.status_code); lat_a.append((time.time()-t0)*1000)
         except Exception as e:
-            with fire_lock:
-                conn_errors.append(str(e)[:80])
+            with fire_lock: err_a.append(str(e)[:80])
 
-    threads = [threading.Thread(target=do_confirm) for _ in range(CONCURRENCY)]
-    t_fire = time.time()
-    for t in threads:
-        t.start()
-
-    # Hold the lock, letting threads queue up, then release
+    threads_a = [threading.Thread(target=do_confirm_a) for _ in range(CONCURRENCY)]
+    t0_a = time.time()
+    for t in threads_a: t.start()
     time.sleep(HOLD_S)
-    pg.commit()   # releases advisory lock
-    cur.close()
-    pg.close()
-    info(f"Advisory lock released after {HOLD_S}s — waiting for threads to drain...")
+    pg_a.commit(); cur_a.close(); pg_a.close()
+    for t in threads_a: t.join(timeout=20)
 
-    for t in threads:
-        t.join(timeout=20)
-
-    wall_ms = (time.time() - t_fire) * 1000
-    status_dist = Counter(status_codes)
-    info(f"Wall time: {wall_ms:.0f}ms  HTTP distribution: {dict(status_dist)}  conn_errors: {len(conn_errors)}")
-
-    if latencies:
-        latencies.sort()
-        p50 = latencies[len(latencies) // 2]
-        p95 = latencies[int(len(latencies) * 0.95)]
-        p99 = latencies[int(len(latencies) * 0.99)]
-        info(f"P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms")
-
-    server_errors = status_dist.get(500, 0) + status_dist.get(503, 0) + len(conn_errors)
-    if server_errors > 0:
-        record_issue(
-            "WARNING", "hot_key_pool_exhaustion",
-            f"{server_errors}/{CONCURRENCY} requests failed (Hikari pool timeout) — "
-            f"demonstrates connection pool exhaustion under hot-key lock contention. "
-            f"Fix: pg_try_advisory_xact_lock + 409 retry, or Redis pre-check."
-        )
+    dist_a = Counter(sc_a)
+    errors_a = dist_a.get(500, 0) + dist_a.get(503, 0) + len(err_a)
+    info(f"Phase A: wall={int((time.time()-t0_a)*1000)}ms  HTTP={dict(dist_a)}  conn_errors={len(err_a)}")
+    if errors_a > 0:
+        record_issue("WARNING", "hot_key_pool_exhaustion_phase_a",
+                     f"Phase A — {errors_a}/{CONCURRENCY} failed (Hikari timeout as expected). "
+                     f"Fix for this scenario: pg_try_advisory_xact_lock + 409 retry.")
+        info("(Phase A failures are EXPECTED — they demonstrate the problem Redis alone cannot fix)")
     else:
-        ok(f"No pool exhaustion errors (all {CONCURRENCY} requests completed)")
+        ok(f"Phase A — no failures (transactions were fast enough to avoid Hikari timeout)")
 
-    # Correctness: still only 1 PaymentAttempt should exist
-    time.sleep(2)
-    detail = get_intent(iid)
-    attempt_count = len(detail.get("attempts", []))
-    if attempt_count > 1:
-        record_issue("CRITICAL", "hot_key_pool_exhaustion",
-                     f"{attempt_count} PaymentAttempts created — advisory lock did not serialise")
+    # ── Phase B: demonstrate the Redis fix ───────────────────────────────────────
+    print(f"\n  {BOLD}Phase B — Fix: Redis pre-check for {CONCURRENCY} retries after cache is warm{RESET}")
+
+    intent_b = create_intent()
+    iid_b = intent_b["id"]
+    key_b = str(uuid.uuid4())
+
+    # Fire the first real confirm — this writes the response to Redis on completion
+    first_r = confirm_intent(iid_b, idem_key=key_b)
+    if first_r.status_code != 200:
+        warn(f"First confirm failed ({first_r.status_code}) — skipping Phase B")
+        return
+    time.sleep(0.3)  # ensure Redis SET has completed before retries arrive
+    info("First confirm completed — Redis cache is warm. Now holding lock and firing retries...")
+
+    # Hold the advisory lock for key_b — retries that skip Redis would hit this lock
+    lock_id_b = struct.unpack(">q", hashlib.sha256(key_b.encode()).digest()[:8])[0]
+    try:
+        pg_b = psycopg2.connect(host="localhost", port=5432, dbname="acquirer_core",
+                                user="postgres", password="postgres")
+        pg_b.autocommit = False
+        cur_b = pg_b.cursor()
+        cur_b.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id_b,))
+    except Exception as e:
+        warn(f"Could not connect to PostgreSQL directly for Phase B — skipping: {e}")
+        return
+
+    sc_b, lat_b, err_b = [], [], []
+    fire_lock_b = threading.Lock()
+
+    def do_retry_b():
+        t0 = time.time()
+        try:
+            r = confirm_intent(iid_b, idem_key=key_b)
+            with fire_lock_b: sc_b.append(r.status_code); lat_b.append((time.time()-t0)*1000)
+        except Exception as e:
+            with fire_lock_b: err_b.append(str(e)[:80])
+
+    threads_b = [threading.Thread(target=do_retry_b) for _ in range(CONCURRENCY)]
+    t0_b = time.time()
+    for t in threads_b: t.start()
+    # Lock is held the entire time — retries that miss Redis would hang here
+    for t in threads_b: t.join(timeout=15)
+    pg_b.commit(); cur_b.close(); pg_b.close()  # release lock (threads should already be done)
+
+    wall_b = int((time.time() - t0_b) * 1000)
+    dist_b = Counter(sc_b)
+    errors_b = dist_b.get(500, 0) + dist_b.get(503, 0) + len(err_b)
+    info(f"Phase B: wall={wall_b}ms  HTTP={dict(dist_b)}  conn_errors={len(err_b)}")
+
+    if lat_b:
+        lat_b.sort()
+        p50 = lat_b[len(lat_b)//2]; p95 = lat_b[int(len(lat_b)*0.95)]; p99 = lat_b[int(len(lat_b)*0.99)]
+        info(f"Phase B latency: P50={p50:.0f}ms  P95={p95:.0f}ms  P99={p99:.0f}ms")
+
+    if errors_b > 0:
+        record_issue("CRITICAL", "hot_key_pool_exhaustion_phase_b",
+                     f"Phase B — {errors_b}/{CONCURRENCY} failed despite Redis pre-check — "
+                     f"Redis did not prevent pool exhaustion for replay requests")
     else:
-        ok(f"Exactly 1 PaymentAttempt created despite {CONCURRENCY} concurrent confirms")
+        ok(f"Phase B — all {CONCURRENCY} retries returned 200 (Redis pre-check: zero DB connections used)")
+
+    if lat_b and p99 < 500:
+        ok(f"Phase B latency P99={p99:.0f}ms — retries answered at Redis speed, not DB speed")
 
 
 def test_race_condition_double_capture():

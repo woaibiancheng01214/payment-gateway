@@ -10,11 +10,13 @@ import jakarta.persistence.PersistenceContext
 import org.slf4j.LoggerFactory
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
+import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.support.TransactionTemplate
 import java.nio.ByteBuffer
 import java.security.MessageDigest
+import java.time.Duration
 import java.time.Instant
 
 @Service
@@ -26,12 +28,37 @@ class PaymentIntentService(
     private val gatewayClient: GatewayClient,
     private val dispatchMarkService: DispatchMarkService,
     private val objectMapper: ObjectMapper,
-    private val transactionTemplate: TransactionTemplate
+    private val transactionTemplate: TransactionTemplate,
+    private val redisTemplate: StringRedisTemplate
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
     @PersistenceContext
     private lateinit var entityManager: EntityManager
+
+    companion object {
+        private const val REDIS_PREFIX = "idempotency:"
+        private val REDIS_TTL = Duration.ofHours(24)
+    }
+
+    /**
+     * Redis pre-check for idempotency keys.
+     *
+     * Returns the cached JSON response string if the key is already known to Redis, or null on
+     * cache miss. Fails open — if Redis is unavailable the call returns null and the request
+     * falls through to the PostgreSQL advisory lock + DB lookup path as normal.
+     */
+    private fun redisGet(key: String): String? =
+        try { redisTemplate.opsForValue().get(REDIS_PREFIX + key) }
+        catch (e: Exception) { log.warn("Redis GET failed, falling through to DB: ${e.message}"); null }
+
+    /**
+     * Writes the idempotency response to Redis after the DB transaction has committed.
+     * Fails open — a Redis write failure does not affect the response to the caller.
+     */
+    private fun redisSet(key: String, value: String) =
+        try { redisTemplate.opsForValue().set(REDIS_PREFIX + key, value, REDIS_TTL) }
+        catch (e: Exception) { log.warn("Redis SET failed for idempotency key '$key': ${e.message}") }
 
     /**
      * Acquires a PostgreSQL transaction-level advisory lock keyed on the idempotency key string.
@@ -41,6 +68,7 @@ class PaymentIntentService(
      * back — no manual cleanup required. Because the lock lives inside PostgreSQL (not the JVM),
      * it works across every application instance connected to the same database.
      *
+     * This is the fallback path — only reached on a Redis cache miss.
      * Lock ID is derived from the first 8 bytes of SHA-256(key), giving a 64-bit integer with
      * negligible collision probability (~1 in 2^64).
      */
@@ -54,43 +82,60 @@ class PaymentIntentService(
         log.debug("Advisory lock acquired for idempotency key '$key' (lockId=$lockId)")
     }
 
-    @Transactional
     fun createPaymentIntent(
         request: CreatePaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
-        val requestHash = if (idempotencyKey != null) {
-            acquireIdempotencyLock(idempotencyKey)
-            val hash = HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
-            val existing = idempotencyKeyRepository.findById(idempotencyKey)
-            if (existing.isPresent) {
-                if (existing.get().requestHash != hash) {
-                    throw IllegalArgumentException(
-                        "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
-                    )
-                }
-                log.info("Returning cached create response for idempotency key $idempotencyKey")
-                return objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
-            }
-            hash
-        } else null
-
-        val intent = PaymentIntent(
-            amount = request.amount,
-            currency = request.currency.uppercase(),
-            status = PaymentIntentStatus.REQUIRES_CONFIRMATION
-        )
-        paymentIntentRepository.save(intent)
-        val response = intent.toResponse()
-
+        // Redis pre-check — short-circuits before acquiring any DB connection.
+        // On a cache hit the advisory lock and DB lookup are skipped entirely,
+        // preventing Hikari pool exhaustion under hot-key retry storms.
         if (idempotencyKey != null) {
-            idempotencyKeyRepository.save(
-                IdempotencyKey(
-                    key = idempotencyKey,
-                    requestHash = requestHash!!,
-                    response = objectMapper.writeValueAsString(response)
-                )
+            redisGet(idempotencyKey)?.let {
+                log.info("Redis HIT for idempotency key '$idempotencyKey' (create)")
+                return objectMapper.readValue(it, PaymentIntentResponse::class.java)
+            }
+        }
+
+        val response = transactionTemplate.execute {
+            val requestHash = if (idempotencyKey != null) {
+                acquireIdempotencyLock(idempotencyKey)
+                val hash = HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
+                val existing = idempotencyKeyRepository.findById(idempotencyKey)
+                if (existing.isPresent) {
+                    if (existing.get().requestHash != hash) {
+                        throw IllegalArgumentException(
+                            "Idempotency key '$idempotencyKey' was already used with a different amount/currency"
+                        )
+                    }
+                    log.info("Returning cached create response for idempotency key $idempotencyKey")
+                    return@execute objectMapper.readValue(existing.get().response, PaymentIntentResponse::class.java)
+                }
+                hash
+            } else null
+
+            val intent = PaymentIntent(
+                amount = request.amount,
+                currency = request.currency.uppercase(),
+                status = PaymentIntentStatus.REQUIRES_CONFIRMATION
             )
+            paymentIntentRepository.save(intent)
+            val resp = intent.toResponse()
+
+            if (idempotencyKey != null) {
+                idempotencyKeyRepository.save(
+                    IdempotencyKey(
+                        key = idempotencyKey,
+                        requestHash = requestHash!!,
+                        response = objectMapper.writeValueAsString(resp)
+                    )
+                )
+            }
+            resp
+        }!!
+
+        // Write to Redis after transaction commits so cache is only populated on success.
+        if (idempotencyKey != null) {
+            redisSet(idempotencyKey, objectMapper.writeValueAsString(response))
         }
         return response
     }
@@ -100,6 +145,14 @@ class PaymentIntentService(
         request: ConfirmPaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
+        // Redis pre-check — short-circuits before acquiring any DB connection.
+        if (idempotencyKey != null) {
+            redisGet(idempotencyKey)?.let {
+                log.info("Redis HIT for idempotency key '$idempotencyKey' (confirm)")
+                return objectMapper.readValue(it, PaymentIntentResponse::class.java)
+            }
+        }
+
         val (response, attemptToDispatch) = transactionTemplate.execute {
             // Acquire advisory lock first (before the row lock) so concurrent confirms
             // for the same idempotency key are serialised at the DB level. This prevents
@@ -165,6 +218,11 @@ class PaymentIntentService(
 
             Pair(resp, internalAttempt as InternalAttempt?)
         }!!
+
+        // Write to Redis after transaction commits (fail-open: Redis is cache, DB is source of truth)
+        if (idempotencyKey != null) {
+            redisSet(idempotencyKey, objectMapper.writeValueAsString(response))
+        }
 
         // Transaction committed, DB connection released — safe to block on gateway
         dispatchBestEffort(attemptToDispatch)

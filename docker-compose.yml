@@ -75,12 +75,24 @@ services:
       timeout: 5s
       retries: 20
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   acquirer-core-backend:
     build:
       context: ./acquirer-core-backend
       dockerfile: Dockerfile
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "8080:8080"
@@ -91,6 +103,8 @@ services:
       GATEWAY_SERVER_URL: http://external-payment-gateway:8081
       GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/webhooks/gateway
       GATEWAY_WEBHOOK_SECRET: payment-gateway-webhook-secret-2026
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
     deploy:
       resources:
         limits:
