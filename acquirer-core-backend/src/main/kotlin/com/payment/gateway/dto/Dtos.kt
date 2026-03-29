@@ -12,6 +12,9 @@ import jakarta.validation.constraints.Size
 import java.time.Instant
 
 data class CreatePaymentIntentRequest(
+    @field:NotBlank(message = "Merchant ID is required")
+    val merchantId: String = "",
+
     @field:Min(value = 1, message = "Amount must be at least 1 (minor currency unit)")
     val amount: Long,
 
@@ -58,6 +61,7 @@ data class WebhookRequest(
 
 data class PaymentIntentResponse(
     val id: String,
+    val merchantId: String,
     val amount: Long,
     val currency: String,
     val status: String,
@@ -96,6 +100,7 @@ data class InternalAttemptResponse(
 
 data class PaymentIntentDetailResponse(
     val id: String,
+    val merchantId: String,
     val amount: Long,
     val currency: String,
     val status: String,
@@ -124,7 +129,7 @@ data class PaymentAttemptDetailResponse(
 private val metadataMapper = jacksonObjectMapper()
 
 fun PaymentIntent.toResponse() = PaymentIntentResponse(
-    id = id, amount = amount, currency = currency.name,
+    id = id, merchantId = merchantId, amount = amount, currency = currency.name,
     status = status.name.lowercase(),
     description = description,
     statementDescriptor = statementDescriptor,
@@ -144,7 +149,7 @@ fun PaymentAttempt.toResponse() = PaymentAttemptResponse(
 )
 
 fun PaymentIntent.toDetailResponse(attempts: List<PaymentAttemptDetailResponse>) = PaymentIntentDetailResponse(
-    id = id, amount = amount, currency = currency.name,
+    id = id, merchantId = merchantId, amount = amount, currency = currency.name,
     status = status.name.lowercase(),
     description = description,
     statementDescriptor = statementDescriptor,

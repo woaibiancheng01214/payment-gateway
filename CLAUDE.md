@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A payment gateway system with six Kotlin/Spring Boot 3.2 microservices, PostgreSQL, Redis, Kafka, and Debezium CDC. Services are split into PCI and non-PCI zones. All services use JDK 17 and Gradle (Kotlin DSL).
+A payment gateway system with seven Kotlin/Spring Boot 3.2 microservices, PostgreSQL, Redis, Kafka, and Debezium CDC. Services are split into PCI and non-PCI zones. All services use JDK 17 and Gradle (Kotlin DSL).
 
 ## Build & Run Commands
 
@@ -41,16 +41,18 @@ Replace `acquirer-core-backend` with any service directory name as needed.
 | **card-vault-service** | PCI | 8083 (internal) | `card_vault` | Encrypted card data storage (AES-256-GCM) |
 | **token-service** | PCI | 8084 (internal) | `token_service` | Payment method references (brand, last4, expiry — no PAN) |
 | **card-auth-service** | PCI | 8085 (internal) | `card_auth` | Authorization/capture orchestration, gateway dispatch, InternalAttempt lifecycle |
+| **merchant-service** | Non-PCI | 8087 (external) | `merchant_service` | Merchant CRUD — all PaymentIntents scoped to a merchant |
 
 PCI zone services have **no external port mappings** — accessible only within the Docker network.
 
 ### Data Flow
 
-1. Client creates/confirms/captures payment intents via `acquirer-core-backend` REST API (`/v1/payment_intents`)
-2. On confirm: checkout calls `card-vault-service` (encrypt PAN) → `token-service` (create payment method) → `card-auth-service` (dispatch auth)
-3. `card-auth-service` dispatches to `external-payment-gateway`
-4. Gateway processes asynchronously, sends webhook to checkout → forwarded to `card-auth-service`
-5. Debezium captures `payment_intents` table changes via PostgreSQL WAL → Kafka → `ledger-service`
+1. Merchant created via `merchant-service` REST API (`/v1/merchants`)
+2. Client creates/confirms/captures payment intents via `acquirer-core-backend` REST API (`/v1/payment_intents`) — each intent scoped to a merchant (validated via `merchant-service`)
+3. On confirm: checkout calls `card-vault-service` (encrypt PAN) → `token-service` (create payment method) → `card-auth-service` (dispatch auth)
+4. `card-auth-service` dispatches to `external-payment-gateway`
+5. Gateway processes asynchronously, sends webhook to checkout → forwarded to `card-auth-service`
+6. Debezium captures `payment_intents` table changes via PostgreSQL WAL → Kafka → `ledger-service`
 
 ### Key Patterns
 
@@ -66,7 +68,8 @@ PCI zone services have **no external port mappings** — accessible only within 
 
 ### Entity Hierarchy
 
-- `acquirer-core-backend`: `PaymentIntent` → has many `PaymentAttempt`
+- `merchant-service`: `Merchant` (id, name, status)
+- `acquirer-core-backend`: `PaymentIntent` (scoped to merchant) → has many `PaymentAttempt`
 - `card-auth-service`: `InternalAttempt` (AUTH or CAPTURE type, linked by `paymentAttemptId`)
 - `card-vault-service`: `CardData` (encrypted PAN)
 - `token-service`: `PaymentMethod` (brand, last4, expiry, status)
@@ -91,7 +94,7 @@ PCI zone services have **no external port mappings** — accessible only within 
 - Redis 7 for distributed locking and idempotency cache
 - Kafka (KRaft mode, single broker) for CDC event streaming
 - Debezium Connect 2.5 with PostgreSQL connector
-- Database initialization: `infra/init-db.sql` creates all 5 databases
+- Database initialization: `infra/init-db.sql` creates all 6 databases
 - Docker secrets in `infra/secrets/` for passwords, webhook secret, vault encryption key
 
 ## Coding Rules
@@ -125,6 +128,7 @@ All Spring Boot services expose `/actuator/prometheus` via Micrometer.
 curl http://localhost:8080/actuator/health  # checkout (acquirer-core-backend)
 curl http://localhost:8081/actuator/health  # external gateway
 curl http://localhost:8082/actuator/health  # ledger
+curl http://localhost:8087/actuator/health  # merchant
 # PCI services: accessible only from within Docker network
 ```
 

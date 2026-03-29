@@ -50,4 +50,12 @@ class PaymentIntentController(
     fun list(@PageableDefault(size = 20) pageable: Pageable): ResponseEntity<Page<PaymentIntentResponse>> {
         return ResponseEntity.ok(paymentIntentService.listPaymentIntents(pageable))
     }
+
+    @GetMapping("/merchant/{merchantId}")
+    fun listByMerchant(
+        @PathVariable merchantId: String,
+        @PageableDefault(size = 20) pageable: Pageable
+    ): ResponseEntity<Page<PaymentIntentResponse>> {
+        return ResponseEntity.ok(paymentIntentService.listPaymentIntentsByMerchant(merchantId, pageable))
+    }
 }

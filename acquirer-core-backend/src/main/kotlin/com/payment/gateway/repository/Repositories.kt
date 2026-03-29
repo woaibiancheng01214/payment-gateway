@@ -2,6 +2,8 @@ package com.payment.gateway.repository
 
 import com.payment.gateway.entity.*
 import jakarta.persistence.LockModeType
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Lock
 import org.springframework.data.jpa.repository.Query
@@ -17,6 +19,8 @@ interface PaymentIntentRepository : JpaRepository<PaymentIntent, String> {
 
     @Query("SELECT p FROM PaymentIntent p WHERE p.status = :status AND p.updatedAt < :before ORDER BY p.updatedAt ASC LIMIT :limit")
     fun findByStatusAndUpdatedAtBefore(status: PaymentIntentStatus, before: Instant, limit: Int): List<PaymentIntent>
+
+    fun findByMerchantId(merchantId: String, pageable: Pageable): Page<PaymentIntent>
 }
 
 @Repository

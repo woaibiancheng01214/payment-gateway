@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS merchants (
+    id         VARCHAR(255) PRIMARY KEY,
+    name       VARCHAR(255) NOT NULL,
+    status     VARCHAR(50)  NOT NULL DEFAULT 'ACTIVE',
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+);

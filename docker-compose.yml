@@ -152,6 +152,26 @@ services:
 
   # ── Non-PCI Zone: External-facing services ──────────────────────────────
 
+  merchant-service:
+    build:
+      context: ./merchant-service
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8087:8087"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/merchant_service
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_PROFILES_ACTIVE: docker
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
   acquirer-core-backend:
     build:
       context: ./acquirer-core-backend
@@ -167,6 +187,8 @@ services:
         condition: service_started
       card-auth-service:
         condition: service_started
+      merchant-service:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
@@ -181,6 +203,7 @@ services:
       VAULT_SERVICE_URL: http://card-vault-service:8086
       TOKEN_SERVICE_URL: http://token-service:8084
       AUTH_SERVICE_URL: http://card-auth-service:8085
+      MERCHANT_SERVICE_URL: http://merchant-service:8087
       SPRING_PROFILES_ACTIVE: docker
     deploy:
       resources:

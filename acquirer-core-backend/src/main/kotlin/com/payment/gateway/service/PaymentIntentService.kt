@@ -22,6 +22,7 @@ class PaymentIntentService(
     private val vaultClient: VaultClient,
     private val tokenClient: TokenClient,
     private val authClient: AuthClient,
+    private val merchantClient: MerchantClient,
     private val lockManager: DistributedLockManager,
     private val objectMapper: ObjectMapper,
     private val transactionTemplate: TransactionTemplate
@@ -36,8 +37,14 @@ class PaymentIntentService(
     ): PaymentIntentResponse {
         val currency = request.validatedCurrency()
 
+        // Validate merchant exists
+        if (!merchantClient.merchantExists(request.merchantId)) {
+            throw IllegalArgumentException("Merchant not found: ${request.merchantId}")
+        }
+
         val requestHash = if (idempotencyKey != null) {
             HashUtils.sha256(
+                "${request.merchantId}" +
                 "${request.amount}${currency.name}" +
                 "${request.description.orEmpty()}" +
                 "${request.customerEmail.orEmpty()}" +
@@ -69,6 +76,7 @@ class PaymentIntentService(
                 }
 
                 val intent = PaymentIntent(
+                    merchantId = request.merchantId,
                     amount = request.amount,
                     currency = currency,
                     description = request.description,
@@ -317,4 +325,11 @@ class PaymentIntentService(
 
     fun listPaymentIntents(pageable: Pageable): Page<PaymentIntentResponse> =
         paymentIntentRepository.findAll(pageable).map { it.toResponse() }
+
+    fun listPaymentIntentsByMerchant(merchantId: String, pageable: Pageable): Page<PaymentIntentResponse> {
+        if (!merchantClient.merchantExists(merchantId)) {
+            throw IllegalArgumentException("Merchant not found: $merchantId")
+        }
+        return paymentIntentRepository.findByMerchantId(merchantId, pageable).map { it.toResponse() }
+    }
 }

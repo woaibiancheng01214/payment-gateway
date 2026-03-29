@@ -28,6 +28,7 @@ CURRENCIES = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD"]
 BASE = "http://localhost:8080"
 GATEWAY_BASE = "http://localhost:8081"
 LEDGER_BASE = "http://localhost:8082"
+MERCHANT_BASE = "http://localhost:8087"
 WEBHOOK_SECRET = "payment-gateway-webhook-secret-2026"
 RESULTS = []
 LOCK = threading.Lock()
@@ -88,10 +89,35 @@ def rand_amount():
 def rand_currency():
     return random.choice(CURRENCIES)
 
-def create_intent(amount=None, currency=None) -> dict:
+# ─── merchant helpers ────────────────────────────────────────────────────────
+
+def create_merchant(name: str) -> dict:
+    r = requests.post(f"{MERCHANT_BASE}/v1/merchants", json={"name": name}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def get_merchant(merchant_id: str) -> dict:
+    r = requests.get(f"{MERCHANT_BASE}/v1/merchants/{merchant_id}", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# Lazily-created shared merchant for non-sustained tests
+_default_merchant = None
+
+def ensure_test_merchant() -> str:
+    """Returns the ID of a shared test merchant, creating it on first call."""
+    global _default_merchant
+    if _default_merchant is None:
+        m = create_merchant("stress-test-default")
+        _default_merchant = m["id"]
+    return _default_merchant
+
+def create_intent(amount=None, currency=None, merchant_id=None) -> dict:
     amount = amount or rand_amount()
     currency = currency or rand_currency()
-    r = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency}, timeout=10)
+    merchant_id = merchant_id or ensure_test_merchant()
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": merchant_id, "amount": amount, "currency": currency}, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -233,15 +259,17 @@ def test_idempotency_correctness():
     key = str(uuid.uuid4())
     amount = rand_amount()
     currency = rand_currency()
+    merchant_id = ensure_test_merchant()
+    payload = {"merchantId": merchant_id, "amount": amount, "currency": currency}
 
-    r1 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
+    r1 = requests.post(f"{BASE}/v1/payment_intents", json=payload,
                        headers={"Idempotency-Key": key}, timeout=10)
     r1.raise_for_status()
     first_id = r1.json()["id"]
     ok(f"First create: id={first_id}")
 
     # Replay — same key, same payload → should return cached response
-    r2 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
+    r2 = requests.post(f"{BASE}/v1/payment_intents", json=payload,
                        headers={"Idempotency-Key": key}, timeout=10)
     if r2.status_code in (200, 201) and r2.json()["id"] == first_id:
         ok("Replay returns same cached response")
@@ -249,7 +277,8 @@ def test_idempotency_correctness():
         record_issue("CRITICAL", "idempotency", f"Replay failed: {r2.status_code} {r2.text}")
 
     # Same key, different payload → should be rejected
-    r3 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount + 1, "currency": currency},
+    diff_payload = {"merchantId": merchant_id, "amount": amount + 1, "currency": currency}
+    r3 = requests.post(f"{BASE}/v1/payment_intents", json=diff_payload,
                        headers={"Idempotency-Key": key}, timeout=10)
     if r3.status_code == 400:
         ok("Different payload with same key correctly rejected (400)")
@@ -260,7 +289,7 @@ def test_idempotency_correctness():
     # Concurrent replays — all should return the same response
     replay_results = []
     def replay():
-        r = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
+        r = requests.post(f"{BASE}/v1/payment_intents", json=payload,
                           headers={"Idempotency-Key": key}, timeout=10)
         with LOCK:
             replay_results.append(r.json().get("id"))
@@ -770,7 +799,7 @@ def test_pci_service_architecture():
         record_issue("WARNING", "dead_letter_api", f"Dead-letter API failed: {e}")
 
     # 4. Swagger / OpenAPI docs
-    for port, name in [(8080, "checkout"), (8081, "gateway"), (8082, "ledger")]:
+    for port, name in [(8080, "checkout"), (8081, "gateway"), (8082, "ledger"), (8087, "merchant")]:
         try:
             r = requests.get(f"http://localhost:{port}/api-docs", timeout=5)
             if r.status_code == 200:
@@ -781,8 +810,9 @@ def test_pci_service_architecture():
             warn(f"OpenAPI docs not available for {name}")
 
     # 5. Input validation: test that invalid requests are rejected with structured errors
+    merchant_id = ensure_test_merchant()
     r = requests.post(f"{BASE}/v1/payment_intents",
-                      json={"amount": -100, "currency": "INVALID"},
+                      json={"merchantId": merchant_id, "amount": -100, "currency": "INVALID"},
                       timeout=5)
     assert r.status_code == 400, f"Expected 400 for invalid input, got {r.status_code}"
     error_body = r.json()
@@ -792,10 +822,24 @@ def test_pci_service_architecture():
 
     # 6. Verify currency enum validation
     r = requests.post(f"{BASE}/v1/payment_intents",
-                      json={"amount": 100, "currency": "XYZ"},
+                      json={"merchantId": merchant_id, "amount": 100, "currency": "XYZ"},
                       timeout=5)
     assert r.status_code == 400, f"Expected 400 for invalid currency, got {r.status_code}"
     ok("Invalid currency 'XYZ' correctly rejected")
+
+    # 7. Verify merchant validation — missing merchantId
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"amount": 100, "currency": "USD"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for missing merchantId, got {r.status_code}"
+    ok("Missing merchantId correctly rejected")
+
+    # 8. Verify merchant validation — invalid merchantId
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": "merch_nonexistent", "amount": 100, "currency": "USD"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for invalid merchantId, got {r.status_code}"
+    ok("Invalid merchantId correctly rejected")
 
 
 def fetch_server_metrics(base_url, label):
@@ -1042,9 +1086,20 @@ def test_sustained_load():
     print(f"{BOLD}   Sustained Load Test — {THREADS} TPS × {DURATION_S}s{RESET}")
     print(f"{BOLD}{'═'*60}{RESET}")
 
+    # ── Pre-traffic: Create one merchant per worker ──────────────────────
+    print(f"\n  {BOLD}Creating {THREADS} merchants (one per worker)...{RESET}")
+    merchants = []
+    for i in range(THREADS):
+        m = create_merchant(f"load-test-merchant-{i}")
+        merchants.append(m)
+        if (i + 1) % 25 == 0:
+            info(f"  Created {i + 1}/{THREADS} merchants")
+    ok(f"Created {len(merchants)} merchants")
+
     print_metrics_snapshot("Before Load")
 
     created_ids = []
+    created_merchant_map = {}  # intent_id -> merchant_id
     create_latencies = []
     confirm_latencies = []
     errors_5xx = []
@@ -1055,13 +1110,14 @@ def test_sustained_load():
 
     confirm_queue = queue.Queue()
 
-    def create_worker():
+    def create_worker(worker_index):
         """Each worker loops: create → enqueue confirm → pace to 1 TPS."""
+        merchant_id = merchants[worker_index]["id"]
         while not stop_event.is_set():
             try:
                 t0 = time.time()
                 r = requests.post(f"{BASE}/v1/payment_intents",
-                                  json={"amount": rand_amount(), "currency": rand_currency()}, timeout=10)
+                                  json={"merchantId": merchant_id, "amount": rand_amount(), "currency": rand_currency()}, timeout=10)
                 create_ms = (time.time() - t0) * 1000
                 if r.status_code >= 500:
                     with ids_lock:
@@ -1072,6 +1128,7 @@ def test_sustained_load():
                     with ids_lock:
                         create_latencies.append(create_ms)
                         created_ids.append(iid)
+                        created_merchant_map[iid] = merchant_id
                     confirm_queue.put(iid)
 
             except requests.exceptions.RequestException as e:
@@ -1110,7 +1167,7 @@ def test_sustained_load():
     # ── Phase 1: Traffic ──────────────────────────────────────────────────
     CONFIRM_THREADS = 100  # separate pool to drain confirm queue without blocking creates
     info(f"Starting {THREADS} create + {CONFIRM_THREADS} confirm threads for {DURATION_S}s...")
-    create_threads = [threading.Thread(target=create_worker, daemon=True) for _ in range(THREADS)]
+    create_threads = [threading.Thread(target=create_worker, args=(i,), daemon=True) for i in range(THREADS)]
     confirm_threads = [threading.Thread(target=confirm_worker, daemon=True) for _ in range(CONFIRM_THREADS)]
     t_start = time.time()
     for t in create_threads + confirm_threads:
@@ -1316,6 +1373,38 @@ def test_sustained_load():
     else:
         record_issue("WARNING", "sustained_terminal",
                      f"Only {terminal_pct:.1f}% reached terminal within {DRAIN_S}s drain")
+
+    # ── Merchant distribution validation ──────────────────────────────────
+    print(f"\n  {BOLD}Validating merchant distribution...{RESET}")
+    merchant_intent_counts = Counter()
+    merchant_mismatches = 0
+    for iid in created_ids[:min(500, total_created)]:
+        expected_merchant = created_merchant_map.get(iid)
+        if expected_merchant:
+            merchant_intent_counts[expected_merchant] += 1
+            try:
+                detail = get_intent(iid)
+                actual_merchant = detail.get("merchantId", "")
+                if actual_merchant != expected_merchant:
+                    merchant_mismatches += 1
+                    if merchant_mismatches <= 3:
+                        record_issue("CRITICAL", "sustained_merchant",
+                                     f"Intent {iid}: expected merchant {expected_merchant}, got {actual_merchant}")
+            except Exception:
+                pass
+
+    unique_merchants_seen = len(merchant_intent_counts)
+    info(f"Intents distributed across {unique_merchants_seen} merchants (sample of {min(500, total_created)})")
+    if merchant_mismatches == 0:
+        ok("All sampled intents belong to the correct merchant")
+    else:
+        record_issue("CRITICAL", "sustained_merchant",
+                     f"{merchant_mismatches} intents have wrong merchantId")
+    if unique_merchants_seen >= THREADS * 0.8:
+        ok(f"Good merchant distribution: {unique_merchants_seen}/{THREADS} merchants have intents")
+    else:
+        record_issue("WARNING", "sustained_merchant",
+                     f"Only {unique_merchants_seen}/{THREADS} merchants have intents — uneven distribution")
 
     # ── Phase 4: Ledger Consistency ──────────────────────────────────────
     LEDGER_DRAIN_S = 30

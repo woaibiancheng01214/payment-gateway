@@ -17,12 +17,16 @@ enum class PaymentIntentStatus {
 @Table(
     name = "payment_intents",
     indexes = [
-        Index(name = "idx_pi_status_updated", columnList = "status, updatedAt")
+        Index(name = "idx_pi_status_updated", columnList = "status, updatedAt"),
+        Index(name = "idx_pi_merchant_id", columnList = "merchant_id")
     ]
 )
 class PaymentIntent(
     @Id
     val id: String = UUID.randomUUID().toString(),
+
+    @Column(name = "merchant_id", nullable = false)
+    val merchantId: String,
 
     @Column(nullable = false)
     val amount: Long,
@@ -62,5 +66,5 @@ class PaymentIntent(
 
     override fun hashCode(): Int = id.hashCode()
 
-    override fun toString(): String = "PaymentIntent(id=$id, status=$status, amount=$amount, currency=$currency)"
+    override fun toString(): String = "PaymentIntent(id=$id, merchantId=$merchantId, status=$status, amount=$amount, currency=$currency)"
 }

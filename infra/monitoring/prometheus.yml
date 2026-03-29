@@ -14,6 +14,7 @@ scrape_configs:
           - "card-vault-service:8086"
           - "token-service:8084"
           - "card-auth-service:8085"
+          - "merchant-service:8087"
 
   # Container metrics via cAdvisor
   - job_name: "cadvisor"

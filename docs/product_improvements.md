@@ -87,13 +87,19 @@ There's no mechanism for:
 
 ---
 
-### 5. No merchant model (multi-tenancy)
+### 5. No merchant model (multi-tenancy) — PARTIALLY IMPLEMENTED
 
-Everything operates as a single-tenant system. A real payment gateway serves multiple merchants.
+~~Everything operates as a single-tenant system.~~ Basic multi-tenancy is now in place.
 
-**What's needed:**
-- `Merchant` entity with API keys (publishable + secret), webhook URLs, configuration
-- All PaymentIntents scoped to a merchant
+**Implemented:**
+- `merchant-service` microservice (port 8087) with Merchant CRUD (create, get, list)
+- All PaymentIntents scoped to a merchant via required `merchantId` field
+- Internal validation: acquirer-core validates merchant exists before creating intents
+- `GET /v1/payment_intents/merchant/{merchantId}` endpoint for per-merchant intent listing
+- Stress test updated: 100 merchants with distributed payment intents across workers
+
+**Still needed:**
+- Per-merchant API key authentication (publishable + secret keys)
 - Per-merchant webhook delivery
 - Per-merchant reporting and dashboards
 - Per-merchant fee configuration (MDR, processing fees)
