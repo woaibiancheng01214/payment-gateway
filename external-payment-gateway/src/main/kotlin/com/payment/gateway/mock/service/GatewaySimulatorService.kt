@@ -41,7 +41,7 @@ class GatewaySimulatorService(
     fun simulate(
         type: GatewayJobType,
         internalAttemptId: String,
-        paymentMethod: String,
+        cardBrand: String,
         callbackUrl: String,
         retriesLeft: Int = maxRetries,
         delayMs: Long = randomDelay()
@@ -51,7 +51,7 @@ class GatewaySimulatorService(
             return
         }
 
-        if (paymentMethod.contains("card_hang")) {
+        if (cardBrand.contains("card_hang")) {
             log.info("[$internalAttemptId] HANG simulated — no webhook will be fired")
             return
         }
@@ -67,7 +67,7 @@ class GatewaySimulatorService(
                         val backoffMs = 1000L * (1 shl (maxRetries - retriesLeft + 1))
                         log.info("[$internalAttemptId] timeout — retrying in ${backoffMs}ms (${retriesLeft - 1} retries left)")
                         inFlightAttempts.remove(internalAttemptId)
-                        simulate(type, internalAttemptId, paymentMethod, callbackUrl, retriesLeft - 1, backoffMs)
+                        simulate(type, internalAttemptId, cardBrand, callbackUrl, retriesLeft - 1, backoffMs)
                     } else {
                         log.warn("[$internalAttemptId] max retries exhausted — delivering failure")
                         fireWebhook(callbackUrl, internalAttemptId, "failure")

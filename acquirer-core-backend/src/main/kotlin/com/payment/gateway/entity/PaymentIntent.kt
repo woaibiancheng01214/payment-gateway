@@ -31,6 +31,19 @@ data class PaymentIntent(
     @Column(nullable = false)
     val currency: String,
 
+    @Column(columnDefinition = "TEXT")
+    val description: String? = null,
+
+    @Column(length = 22)
+    val statementDescriptor: String? = null,
+
+    @Column(columnDefinition = "TEXT")
+    val metadata: String? = null,
+
+    val customerEmail: String? = null,
+
+    val customerId: String? = null,
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     var status: PaymentIntentStatus = PaymentIntentStatus.REQUIRES_CONFIRMATION,

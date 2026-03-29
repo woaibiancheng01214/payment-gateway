@@ -80,7 +80,9 @@ def signed_webhook_post(internal_attempt_id: str, status: str, timeout: int = 5)
     )
 
 def rand_amount():
-    return random.randint(100, 99999)
+    """Random amount in smallest currency unit (cents) with realistic decimal values.
+    E.g., 1050 = $10.50, 99 = $0.99, 249999 = $2,499.99"""
+    return random.randint(1, 999999)
 
 def rand_currency():
     return random.choice(CURRENCIES)
@@ -92,9 +94,17 @@ def create_intent(amount=None, currency=None) -> dict:
     r.raise_for_status()
     return r.json()
 
-def confirm_intent(intent_id, method="card_4242") -> requests.Response:
+CARD_VISA = {
+    "cardNumber": "4242424242424242",
+    "cardholderName": "Test User",
+    "expiryMonth": 12,
+    "expiryYear": 2030,
+    "cvc": "123"
+}
+
+def confirm_intent(intent_id, card_data=None) -> requests.Response:
     return requests.post(f"{BASE}/payment_intents/{intent_id}/confirm",
-                         json={"paymentMethod": method},
+                         json=card_data or CARD_VISA,
                          headers={"Content-Type": "application/json"}, timeout=15)
 
 def capture_intent(intent_id) -> requests.Response:
@@ -193,7 +203,7 @@ def test_race_condition_double_confirm():
 
     responses = []
     def do_confirm():
-        r = confirm_intent(iid, method="card_4242")
+        r = confirm_intent(iid)
         with LOCK:
             responses.append((r.status_code, r.json()))
 
@@ -452,7 +462,7 @@ def test_data_consistency_under_load():
 
     def confirm_all(intent):
         try:
-            confirm_intent(intent["id"], method="card_4242")
+            confirm_intent(intent["id"])
         except Exception:
             pass
 
@@ -979,7 +989,7 @@ def test_sustained_load():
 
                 t1 = time.time()
                 r2 = requests.post(f"{BASE}/payment_intents/{iid}/confirm",
-                                   json={"paymentMethod": "card_4242"},
+                                   json=CARD_VISA,
                                    headers={"Content-Type": "application/json"},
                                    timeout=10)
                 confirm_ms = (time.time() - t1) * 1000

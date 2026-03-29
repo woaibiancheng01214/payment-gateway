@@ -27,10 +27,9 @@ class PaymentIntentController(
     @PostMapping("/{id}/confirm")
     fun confirm(
         @PathVariable id: String,
-        @RequestBody(required = false) request: ConfirmPaymentIntentRequest?
+        @RequestBody request: ConfirmPaymentIntentRequest
     ): ResponseEntity<PaymentIntentResponse> {
-        val body = request ?: ConfirmPaymentIntentRequest()
-        val response = paymentIntentService.confirmPaymentIntent(id, body)
+        val response = paymentIntentService.confirmPaymentIntent(id, request)
         return ResponseEntity.ok(response)
     }
 

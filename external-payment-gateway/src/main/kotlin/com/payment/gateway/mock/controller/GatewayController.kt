@@ -23,12 +23,12 @@ class GatewayController(
 
     @PostMapping("/authorize")
     fun authorize(@RequestBody req: AuthorizeRequest): ResponseEntity<GatewayAckResponse> {
-        log.info("Authorize received: attemptId=${req.internalAttemptId} method=${req.paymentMethod} amount=${req.amount} ${req.currency}")
+        log.info("Authorize received: attemptId=${req.internalAttemptId} token=${req.paymentToken} brand=${req.cardBrand} amount=${req.amount} ${req.currency}")
         simulateAckLatency(req.internalAttemptId)
         simulator.simulate(
             type = GatewayJobType.AUTH,
             internalAttemptId = req.internalAttemptId,
-            paymentMethod = req.paymentMethod,
+            cardBrand = req.cardBrand,
             callbackUrl = req.callbackUrl
         )
         return ResponseEntity.status(HttpStatus.ACCEPTED)
@@ -42,7 +42,7 @@ class GatewayController(
         simulator.simulate(
             type = GatewayJobType.CAPTURE,
             internalAttemptId = req.internalAttemptId,
-            paymentMethod = "",
+            cardBrand = "",
             callbackUrl = req.callbackUrl
         )
         return ResponseEntity.status(HttpStatus.ACCEPTED)

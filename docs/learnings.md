@@ -409,3 +409,126 @@ opposite imbalances canceling out).
 hasn't caught up. The test reports these as warnings, not failures — they indicate
 propagation delay, not data corruption. Re-running the check after a longer wait confirms
 they resolve.
+
+---
+
+## 18. Card tokenization — the PAN must never touch the database
+
+The original design stored `paymentMethod` as a plain string (`"card_4242"`) in
+`PaymentAttempt`. In a real system that string would be a 16-digit PAN, making every
+service that reads `payment_attempts` — the orchestrator, the scheduler, the gateway
+client, the detail endpoint — PCI DSS Level 1 in-scope.
+
+**The fix: tokenize at the boundary.** When the confirm request arrives with raw card
+data (`cardNumber`, `cardholderName`, `expiryMonth`, `expiryYear`, `cvc`), the service
+tokenizes immediately via an in-memory `TokenVaultService` and stores only the opaque
+token (`tok_<uuid>`) in the database. The raw PAN lives exclusively in the vault's
+`ConcurrentHashMap` — never serialized to disk, never written to logs.
+
+```
+Client POST /confirm  →  tokenize()  →  DB stores "tok_abc123"
+                                     →  vault holds {PAN, expiry, CVC} in memory only
+```
+
+**Derived fields for display and routing:**
+- `cardBrand` — derived from the BIN (first digits): `4xxx` → visa, `51-55xx` → mastercard,
+  `34/37xx` → amex. Stored in `PaymentAttempt` for display and passed to the gateway for
+  behavior routing.
+- `last4` — last 4 digits of the PAN, safe for receipts and customer-facing UIs.
+
+The gateway never sees the raw card. It receives `paymentToken` + `cardBrand` and uses
+`cardBrand` for behavior decisions (success/fail/hang simulation). This models the real
+architecture where acquirers pass network tokens or vault references to processors.
+
+**PCI DSS 4.0 scope reduction:** With this architecture, only the `TokenVaultService` (and
+the HTTP endpoint that receives the card data) are in the CDE (Cardholder Data Environment).
+Every other component — database, schedulers, gateway client, ledger service — handles
+only tokens and is out of scope. In production the vault would be a separate, hardened
+service with HSM-backed encryption, but the architecture is identical.
+
+**Takeaway:** Tokenize as early as possible (at the API boundary), store only the token,
+and derive everything else (brand, last4) at tokenization time. The rest of the system
+should never need to detokenize.
+
+---
+
+## 19. Enriching domain objects — what fields a PaymentIntent actually needs
+
+The initial `PaymentIntent` had only `amount` and `currency`. That's enough for the state
+machine to work, but it makes the system feel like a toy. Real payment intents (Stripe,
+Adyen) carry merchant context that drives downstream behavior.
+
+**Fields added:**
+
+| Field | Why it matters |
+|---|---|
+| `description` | Human-readable purpose ("Order #1234"). Appears in dashboards, dispute evidence, and reconciliation reports. |
+| `statementDescriptor` | What the cardholder sees on their bank statement. Visa caps at 22 characters — enforced with `.take(22)` at creation time. |
+| `metadata` | Arbitrary key-value pairs for the merchant (`orderId`, `sku`, `userId`). Stored as JSON TEXT in the database. Never used by the payment system itself — purely merchant-side context. |
+| `customerEmail` | For receipts, fraud scoring, and chargeback evidence. |
+| `customerId` | Merchant's customer reference. Enables per-customer payment history queries. |
+
+**Design decisions:**
+- `metadata` is stored as a JSON string column, not a `jsonb` column. Keeps the code
+  database-agnostic and avoids JPA/Hibernate `jsonb` mapping complexity. Serialized with
+  Jackson on write, deserialized on read in the DTO extension function.
+- `metadata` and `statementDescriptor` are excluded from the idempotency hash. Two creates
+  with the same amount/currency/description/customer but different metadata are the same
+  payment intent — metadata is merchant-side context, not payment identity.
+- All new fields are nullable with defaults, so existing code paths (scheduler, webhook
+  handler, capture) don't need changes.
+
+**Takeaway:** A domain object should carry enough context for every downstream consumer —
+dashboards, receipts, reconciliation, fraud — without requiring a join back to the
+merchant's system. But keep the idempotency boundary tight: only fields that define
+"this is a different payment" should affect the hash.
+
+---
+
+## 20. Backward compatibility when renaming entity fields with Hibernate `ddl-auto=update`
+
+Renaming `PaymentAttempt.paymentMethod` to `PaymentAttempt.paymentToken` sounds simple,
+but `ddl-auto=update` doesn't rename columns — it creates a new one and leaves the old one
+orphaned. With a real migration tool (Flyway, Liquibase) you'd write `ALTER TABLE ... RENAME
+COLUMN`. With `ddl-auto=update`, the cleanest approach is:
+
+```kotlin
+@Column(name = "payment_method", nullable = false)
+val paymentToken: String
+```
+
+The Kotlin field gets the semantically correct name (`paymentToken`), but the `@Column(name)`
+annotation keeps the database column as `payment_method`. No schema change, no data
+migration, no orphaned columns. The code reads clearly (`attempt.paymentToken`) while the
+database stays stable.
+
+**Takeaway:** When using `ddl-auto=update`, rename the code, not the column. Use
+`@Column(name = "old_name")` to bridge the gap. Reserve actual column renames for
+migration tools that can do it atomically.
+
+---
+
+## 21. Adding new entity fields doesn't break CDC consumers
+
+When new nullable columns (`description`, `metadata`, `customer_email`, etc.) were added
+to `payment_intents`, Debezium started including them in CDC events to Kafka. The
+ledger-service consumer could have broken if it was strict about unknown fields.
+
+It didn't, because the Debezium DTOs use `@JsonIgnoreProperties(ignoreUnknown = true)`:
+
+```kotlin
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class PaymentIntentSnapshot(
+    val id: String,
+    val amount: Long,
+    val currency: String,
+    val status: String
+)
+```
+
+The ledger only needs `id`, `amount`, `currency`, and `status`. New columns are silently
+ignored during deserialization. No code change required in the ledger service.
+
+**Takeaway:** CDC consumers should always use `ignoreUnknown = true` (or equivalent).
+Schema evolution in the source table is inevitable — consumers should be resilient to
+additive changes by default. Only opt into new fields when you actually need them.

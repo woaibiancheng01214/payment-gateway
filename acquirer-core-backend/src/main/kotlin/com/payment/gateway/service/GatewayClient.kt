@@ -34,7 +34,8 @@ class GatewayClient(
         val payload = parsePayload(internalAttempt.requestPayload)
         val body = mapOf(
             "internalAttemptId" to internalAttempt.id,
-            "paymentMethod" to (payload["paymentMethod"] ?: "card_4242"),
+            "paymentToken" to (payload["paymentToken"] ?: ""),
+            "cardBrand" to (payload["cardBrand"] ?: "unknown"),
             "amount" to (payload["amount"] ?: 0L),
             "currency" to (payload["currency"] ?: "USD"),
             "callbackUrl" to callbackUrl

@@ -1,15 +1,26 @@
 package com.payment.gateway.dto
 
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.payment.gateway.entity.*
 import java.time.Instant
 
 data class CreatePaymentIntentRequest(
     val amount: Long,
-    val currency: String
+    val currency: String,
+    val description: String? = null,
+    val statementDescriptor: String? = null,
+    val metadata: Map<String, String>? = null,
+    val customerEmail: String? = null,
+    val customerId: String? = null
 )
 
 data class ConfirmPaymentIntentRequest(
-    val paymentMethod: String = "card_4242"
+    val cardNumber: String,
+    val cardholderName: String? = null,
+    val expiryMonth: Int,
+    val expiryYear: Int,
+    val cvc: String
 )
 
 data class WebhookRequest(
@@ -22,6 +33,11 @@ data class PaymentIntentResponse(
     val amount: Long,
     val currency: String,
     val status: String,
+    val description: String?,
+    val statementDescriptor: String?,
+    val metadata: Map<String, String>?,
+    val customerEmail: String?,
+    val customerId: String?,
     val createdAt: Instant,
     val updatedAt: Instant
 )
@@ -29,7 +45,9 @@ data class PaymentIntentResponse(
 data class PaymentAttemptResponse(
     val id: String,
     val paymentIntentId: String,
-    val paymentMethod: String,
+    val paymentToken: String,
+    val cardBrand: String?,
+    val last4: String?,
     val status: String,
     val createdAt: Instant,
     val updatedAt: Instant
@@ -53,6 +71,11 @@ data class PaymentIntentDetailResponse(
     val amount: Long,
     val currency: String,
     val status: String,
+    val description: String?,
+    val statementDescriptor: String?,
+    val metadata: Map<String, String>?,
+    val customerEmail: String?,
+    val customerId: String?,
     val createdAt: Instant,
     val updatedAt: Instant,
     val attempts: List<PaymentAttemptDetailResponse>
@@ -61,24 +84,47 @@ data class PaymentIntentDetailResponse(
 data class PaymentAttemptDetailResponse(
     val id: String,
     val paymentIntentId: String,
-    val paymentMethod: String,
+    val paymentToken: String,
+    val cardBrand: String?,
+    val last4: String?,
     val status: String,
     val createdAt: Instant,
     val updatedAt: Instant,
     val internalAttempts: List<InternalAttemptResponse>
 )
 
+private val metadataMapper = jacksonObjectMapper()
+
 fun PaymentIntent.toResponse() = PaymentIntentResponse(
     id = id, amount = amount, currency = currency,
     status = status.name.lowercase(),
+    description = description,
+    statementDescriptor = statementDescriptor,
+    metadata = metadata?.let { metadataMapper.readValue<Map<String, String>>(it) },
+    customerEmail = customerEmail,
+    customerId = customerId,
     createdAt = createdAt, updatedAt = updatedAt
 )
 
 fun PaymentAttempt.toResponse() = PaymentAttemptResponse(
     id = id, paymentIntentId = paymentIntentId,
-    paymentMethod = paymentMethod,
+    paymentToken = paymentToken,
+    cardBrand = cardBrand,
+    last4 = last4,
     status = status.name.lowercase(),
     createdAt = createdAt, updatedAt = updatedAt
+)
+
+fun PaymentIntent.toDetailResponse(attempts: List<PaymentAttemptDetailResponse>) = PaymentIntentDetailResponse(
+    id = id, amount = amount, currency = currency,
+    status = status.name.lowercase(),
+    description = description,
+    statementDescriptor = statementDescriptor,
+    metadata = metadata?.let { metadataMapper.readValue<Map<String, String>>(it) },
+    customerEmail = customerEmail,
+    customerId = customerId,
+    createdAt = createdAt, updatedAt = updatedAt,
+    attempts = attempts
 )
 
 fun InternalAttempt.toResponse() = InternalAttemptResponse(

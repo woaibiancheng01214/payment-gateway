@@ -6,7 +6,10 @@ package com.payment.gateway.mock.dto
 data class AuthorizeRequest(
     /** Correlation ID — echoed back in the webhook payload so the orchestrator can route it. */
     val internalAttemptId: String,
-    val paymentMethod: String,
+    /** Opaque token from the token vault — the gateway never sees the raw PAN. */
+    val paymentToken: String,
+    /** Card brand derived from BIN (e.g., "visa", "mastercard"). Used for behavior routing. */
+    val cardBrand: String,
     val amount: Long,
     val currency: String,
     /** Where to POST the outcome webhook once processing is complete. */

@@ -25,6 +25,7 @@ class PaymentIntentService(
     private val idempotencyKeyRepository: IdempotencyKeyRepository,
     private val gatewayClient: GatewayClient,
     private val dispatchMarkService: DispatchMarkService,
+    private val tokenVaultService: TokenVaultService,
     private val objectMapper: ObjectMapper,
     private val transactionTemplate: TransactionTemplate,
     private val redisTemplate: StringRedisTemplate
@@ -121,7 +122,12 @@ class PaymentIntentService(
         idempotencyKey: String?
     ): PaymentIntentResponse {
         val requestHash = if (idempotencyKey != null) {
-            HashUtils.sha256("${request.amount}${request.currency.uppercase()}")
+            HashUtils.sha256(
+                "${request.amount}${request.currency.uppercase()}" +
+                "${request.description.orEmpty()}" +
+                "${request.customerEmail.orEmpty()}" +
+                "${request.customerId.orEmpty()}"
+            )
         } else null
 
         if (idempotencyKey != null && requestHash != null) {
@@ -149,6 +155,11 @@ class PaymentIntentService(
                 val intent = PaymentIntent(
                     amount = request.amount,
                     currency = request.currency.uppercase(),
+                    description = request.description,
+                    statementDescriptor = request.statementDescriptor?.take(22),
+                    metadata = request.metadata?.let { objectMapper.writeValueAsString(it) },
+                    customerEmail = request.customerEmail,
+                    customerId = request.customerId,
                     status = PaymentIntentStatus.REQUIRES_CONFIRMATION
                 )
                 paymentIntentRepository.save(intent)
@@ -203,6 +214,17 @@ class PaymentIntentService(
         val lockValue = acquireRedisLock(intentId)
             ?: throw IllegalStateException("Another confirm is already in progress for PaymentIntent $intentId")
 
+        // Tokenize card data immediately — raw PAN never reaches the DB or logs
+        val token = tokenVaultService.tokenize(
+            cardNumber = request.cardNumber,
+            cardholderName = request.cardholderName,
+            expiryMonth = request.expiryMonth,
+            expiryYear = request.expiryYear,
+            cvc = request.cvc
+        )
+        val cardBrand = tokenVaultService.resolveCardBrand(token)
+        val last4 = tokenVaultService.resolveLast4(token)
+
         try {
             val (response, attemptToDispatch) = transactionTemplate.execute {
                 val intent = paymentIntentRepository.findByIdForUpdate(intentId)
@@ -220,7 +242,9 @@ class PaymentIntentService(
 
                 val attempt = PaymentAttempt(
                     paymentIntentId = intentId,
-                    paymentMethod = request.paymentMethod,
+                    paymentToken = token,
+                    cardBrand = cardBrand,
+                    last4 = last4,
                     status = PaymentAttemptStatus.PENDING
                 )
                 paymentAttemptRepository.save(attempt)
@@ -229,7 +253,7 @@ class PaymentIntentService(
                     paymentAttemptId = attempt.id,
                     type = InternalAttemptType.AUTH,
                     requestPayload = objectMapper.writeValueAsString(
-                        mapOf("paymentMethod" to request.paymentMethod, "amount" to intent.amount, "currency" to intent.currency)
+                        mapOf("paymentToken" to token, "cardBrand" to cardBrand, "amount" to intent.amount, "currency" to intent.currency)
                     )
                 )
                 internalAttemptRepository.save(internalAttempt)
@@ -419,7 +443,9 @@ class PaymentIntentService(
             PaymentAttemptDetailResponse(
                 id = attempt.id,
                 paymentIntentId = attempt.paymentIntentId,
-                paymentMethod = attempt.paymentMethod,
+                paymentToken = attempt.paymentToken,
+                cardBrand = attempt.cardBrand,
+                last4 = attempt.last4,
                 status = attempt.status.name.lowercase(),
                 createdAt = attempt.createdAt,
                 updatedAt = attempt.updatedAt,
@@ -427,15 +453,7 @@ class PaymentIntentService(
             )
         }
 
-        return PaymentIntentDetailResponse(
-            id = intent.id,
-            amount = intent.amount,
-            currency = intent.currency,
-            status = intent.status.name.lowercase(),
-            createdAt = intent.createdAt,
-            updatedAt = intent.updatedAt,
-            attempts = attemptDetails
-        )
+        return intent.toDetailResponse(attemptDetails)
     }
 
     fun listPaymentIntents(pageable: Pageable): Page<PaymentIntentResponse> =

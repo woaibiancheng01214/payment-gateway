@@ -28,8 +28,12 @@ data class PaymentAttempt(
     @Column(nullable = false)
     val paymentIntentId: String,
 
-    @Column(nullable = false)
-    val paymentMethod: String,
+    @Column(name = "payment_method", nullable = false)
+    val paymentToken: String,
+
+    val cardBrand: String? = null,
+
+    val last4: String? = null,
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
