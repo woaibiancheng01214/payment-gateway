@@ -43,6 +43,7 @@ private class CachedBodyRequest(
 @Component
 class WebhookSignatureFilter(
     @Value("\${gateway.webhook.secret:default-webhook-secret-change-me}") private val webhookSecret: String,
+    @Value("\${gateway.webhook.secret.previous:}") private val previousWebhookSecret: String,
     @Value("\${gateway.webhook.tolerance-seconds:300}") private val toleranceSeconds: Long
 ) : OncePerRequestFilter() {
 
@@ -83,16 +84,24 @@ class WebhookSignatureFilter(
         }
 
         val bodyString = String(bodyBytes, Charsets.UTF_8)
-        val expectedSignature = HmacUtils.hmacSha256(webhookSecret, "$timestamp.$bodyString")
+        val signatureBytes = signature.toByteArray(Charsets.UTF_8)
 
-        if (!MessageDigest.isEqual(
-                signature.toByteArray(Charsets.UTF_8),
-                expectedSignature.toByteArray(Charsets.UTF_8)
-            )
-        ) {
+        // Try current secret first, then previous secret during rotation
+        val currentExpected = HmacUtils.hmacSha256(webhookSecret, "$timestamp.$bodyString")
+        val matchesCurrent = MessageDigest.isEqual(signatureBytes, currentExpected.toByteArray(Charsets.UTF_8))
+
+        val matchesPrevious = if (!matchesCurrent && previousWebhookSecret.isNotBlank()) {
+            val previousExpected = HmacUtils.hmacSha256(previousWebhookSecret, "$timestamp.$bodyString")
+            MessageDigest.isEqual(signatureBytes, previousExpected.toByteArray(Charsets.UTF_8))
+        } else false
+
+        if (!matchesCurrent && !matchesPrevious) {
             log.warn("Webhook rejected: signature mismatch")
             response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid webhook signature")
             return
+        }
+        if (matchesPrevious) {
+            log.info("Webhook verified with previous secret — rotation in progress")
         }
 
         filterChain.doFilter(cachedRequest, response)

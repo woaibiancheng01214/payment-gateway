@@ -16,6 +16,8 @@
     "heartbeat.interval.ms": "10000",
     "snapshot.mode": "initial",
     "tombstones.on.delete": "false",
+    "topic.creation.default.partitions": "8",
+    "topic.creation.default.replication.factor": "1",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "false",
     "value.converter": "org.apache.kafka.connect.json.JsonConverter",

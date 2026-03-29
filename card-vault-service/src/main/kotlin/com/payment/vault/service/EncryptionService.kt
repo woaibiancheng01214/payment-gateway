@@ -14,7 +14,9 @@ import javax.crypto.spec.SecretKeySpec
 @Service
 class EncryptionService(
     @Value("\${vault.encryption.key:}") private val encryptionKey: String,
-    @Value("\${vault.encryption.key-file:}") private val encryptionKeyFile: String
+    @Value("\${vault.encryption.key-file:}") private val encryptionKeyFile: String,
+    @Value("\${vault.encryption.previous-key:}") private val previousKey: String = "",
+    @Value("\${vault.encryption.current-version:1}") private val currentVersion: Int = 1
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
@@ -24,14 +26,26 @@ class EncryptionService(
         private const val TAG_LENGTH_BITS = 128
     }
 
-    private val secretKey: SecretKeySpec by lazy {
-        val keyHex = resolveKey()
-        val keyBytes = hexToBytes(keyHex)
-        SecretKeySpec(keyBytes, "AES")
+    // Map of key version → SecretKeySpec for rotation support
+    private val keyMap: Map<Int, SecretKeySpec> by lazy {
+        val keys = mutableMapOf<Int, SecretKeySpec>()
+        val currentKeyHex = resolveKey()
+        keys[currentVersion] = SecretKeySpec(hexToBytes(currentKeyHex), "AES")
+
+        // Previous key for decrypting old data during rotation
+        if (previousKey.isNotBlank()) {
+            val prevVersion = currentVersion - 1
+            keys[prevVersion] = SecretKeySpec(hexToBytes(previousKey), "AES")
+            log.info("Loaded encryption keys: versions ${keys.keys.sorted()}, current=$currentVersion")
+        } else {
+            log.info("Loaded encryption key: version $currentVersion (no previous key)")
+        }
+        keys
     }
 
+    fun currentKeyVersion(): Int = currentVersion
+
     private fun resolveKey(): String {
-        // Prefer file-based key (Docker secrets) over inline property
         if (encryptionKeyFile.isNotBlank()) {
             val path = Paths.get(encryptionKeyFile)
             if (Files.exists(path)) {
@@ -46,11 +60,14 @@ class EncryptionService(
     }
 
     fun encrypt(plaintext: String): String {
+        val key = keyMap[currentVersion]
+            ?: throw IllegalStateException("Current encryption key version $currentVersion not found")
+
         val iv = ByteArray(IV_LENGTH)
         SecureRandom().nextBytes(iv)
 
         val cipher = Cipher.getInstance(ALGORITHM)
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey, GCMParameterSpec(TAG_LENGTH_BITS, iv))
+        cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(TAG_LENGTH_BITS, iv))
 
         val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
 
@@ -61,14 +78,17 @@ class EncryptionService(
         return Base64.getEncoder().encodeToString(combined)
     }
 
-    fun decrypt(ciphertext: String): String {
+    fun decrypt(ciphertext: String, keyVersion: Int = currentVersion): String {
+        val key = keyMap[keyVersion]
+            ?: throw IllegalStateException("Encryption key version $keyVersion not found")
+
         val combined = Base64.getDecoder().decode(ciphertext)
 
         val iv = combined.copyOfRange(0, IV_LENGTH)
         val encrypted = combined.copyOfRange(IV_LENGTH, combined.size)
 
         val cipher = Cipher.getInstance(ALGORITHM)
-        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_LENGTH_BITS, iv))
+        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(TAG_LENGTH_BITS, iv))
 
         val plaintext = cipher.doFinal(encrypted)
         return String(plaintext, Charsets.UTF_8)

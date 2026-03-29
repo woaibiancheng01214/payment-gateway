@@ -28,14 +28,14 @@ class AuthService(
         val internalAttempt = InternalAttempt(
             paymentAttemptId = request.paymentAttemptId,
             type = InternalAttemptType.AUTH,
-            requestPayload = objectMapper.writeValueAsString(
+            requestPayload = truncatePayload(objectMapper.writeValueAsString(
                 mapOf(
                     "paymentToken" to request.paymentMethodId,
                     "cardBrand" to pmAuth.brand,
                     "amount" to request.amount,
                     "currency" to request.currency
                 )
-            )
+            ))
         )
         internalAttemptRepository.save(internalAttempt)
 
@@ -56,14 +56,14 @@ class AuthService(
         val internalAttempt = InternalAttempt(
             paymentAttemptId = request.paymentAttemptId,
             type = InternalAttemptType.CAPTURE,
-            requestPayload = objectMapper.writeValueAsString(
+            requestPayload = truncatePayload(objectMapper.writeValueAsString(
                 mapOf(
                     "paymentAttemptId" to request.paymentAttemptId,
                     "action" to "capture",
                     "amount" to request.amount,
                     "currency" to request.currency
                 )
-            )
+            ))
         )
         internalAttemptRepository.save(internalAttempt)
 
@@ -95,7 +95,7 @@ class AuthService(
         }
 
         internalAttempt.status = resolvedStatus
-        internalAttempt.responsePayload = objectMapper.writeValueAsString(mapOf("status" to request.status))
+        internalAttempt.responsePayload = truncatePayload(objectMapper.writeValueAsString(mapOf("status" to request.status)))
         internalAttempt.updatedAt = Instant.now()
         internalAttemptRepository.save(internalAttempt)
 
@@ -148,6 +148,9 @@ class AuthService(
             log.warn("Dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
         }
     }
+
+    private fun truncatePayload(payload: String?, maxLength: Int = 4096): String? =
+        if (payload != null && payload.length > maxLength) payload.take(maxLength) else payload
 
     private fun InternalAttempt.toResponse() = InternalAttemptResponse(
         id = id, paymentAttemptId = paymentAttemptId,

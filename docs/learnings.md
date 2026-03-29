@@ -1354,3 +1354,202 @@ but wasn't consumed — services used the environment variable instead.
 and crash dumps. File-based secrets (Docker secrets, Kubernetes secrets, Vault) are the
 minimum acceptable pattern. The inline dev fallback is acceptable for local development
 but must never be the production mechanism.
+
+---
+
+## 48. Cursor-based pagination is O(1) — offset pagination is O(n)
+
+Spring's `Pageable` with `@PageableDefault` generates `OFFSET/LIMIT` SQL. For page N with
+size 20, PostgreSQL must scan and discard N*20 rows before returning the requested 20. At
+page 5000 of a 100M-row table, that's 100K rows scanned per request — and it gets linearly
+worse with depth.
+
+**Fix:** Added keyset (cursor-based) pagination using `(created_at, id)` as the cursor:
+
+```sql
+WHERE (created_at < :cursorTime OR (created_at = :cursorTime AND id < :cursorId))
+ORDER BY created_at DESC, id DESC
+LIMIT :pageSize
+```
+
+This uses the index `(created_at DESC, id DESC)` for a direct seek — O(1) regardless of
+how deep into the result set you are. The client passes `starting_after={last_id}` to get
+the next page.
+
+The existing offset-based endpoints are kept for backward compatibility, but the new
+`/v1/payment_intents/cursor` endpoints should be preferred for any integration that
+paginates large result sets.
+
+**Takeaway:** Offset pagination is a scalability trap that looks fine at 1K rows and
+breaks at 1M. Add cursor-based pagination before you need it — retrofitting pagination
+in a live API is painful.
+
+---
+
+## 49. Kafka partitions unlock parallel CDC consumption
+
+The Debezium CDC topic (`acquirer-core.public.payment_intents`) was created with a single
+partition by default. The ledger-service consumer processed events single-threaded. At
+300+ TPS, CDC event processing becomes the bottleneck — a single consumer can't keep up
+with the write rate.
+
+**Fix:**
+1. Debezium connector config: `topic.creation.default.partitions: 8`
+2. Ledger service: `spring.kafka.listener.concurrency=4`
+
+Kafka guarantees ordering within a partition. Since Debezium partitions by primary key
+(`payment_intent_id`), all events for the same intent hash to the same partition. This
+preserves per-intent ordering (critical for AUTHORIZED→CAPTURED→FAILED sequences) while
+enabling 4x parallel throughput.
+
+**Takeaway:** Single-partition Kafka topics are a hidden bottleneck. Set partitions at
+topic creation time based on expected throughput. The dedup unique constraint in the
+ledger DB provides safety against any out-of-order edge cases.
+
+---
+
+## 50. Encryption key rotation requires versioned ciphertext
+
+The original `EncryptionService` loaded a single key and used it forever. If the key was
+compromised, replacing it would make all existing encrypted PANs unreadable.
+
+**Fix:**
+1. Added `key_version` column to `card_data` (Flyway migration)
+2. `EncryptionService` maintains a map of version → `SecretKeySpec`
+3. New encryptions always use `currentVersion` (configurable)
+4. Decryptions read the version from the DB row and use the corresponding key
+5. Previous key loaded from `vault.encryption.previous-key` property
+
+During rotation:
+- Deploy with `current-version=2` and both keys configured
+- All new encryptions use version 2
+- Old rows still decrypt with version 1
+- Background re-encryption job can gradually migrate old rows to version 2
+- Once all rows are version 2, remove the previous key
+
+**Takeaway:** Key rotation is not just "change the key" — it's a data migration. Version
+the ciphertext at rest so old and new data can coexist during the transition.
+
+---
+
+## 51. PCI audit logging — every cardholder data access must leave a trail
+
+PCI DSS Requirement 10.2 mandates logging all access to cardholder data. The vault service
+decrypted PANs without any record of who requested it, when, or why. In a breach
+investigation, there would be no way to determine which PANs were accessed.
+
+**Fix:** Added an `audit_log` table to the `card_vault` database:
+```sql
+(id, action, card_data_id, caller_service, caller_ip, created_at)
+```
+
+Every `VaultService.getCardData()` call writes an audit record before returning the
+decrypted PAN. The audit write is wrapped in try/catch — a failed audit log should not
+block the payment flow (availability over auditability in real-time).
+
+The `caller_service` field captures the `X-Correlation-Id` header (from Learning 44),
+enabling correlation between the audit log and the payment flow that triggered the access.
+
+**Takeaway:** Audit logging for sensitive data access is not optional in regulated systems.
+Keep the log writes non-blocking (fire-and-forget) so they don't add latency to the
+payment path.
+
+---
+
+## 52. Business metrics are the primary SLIs — JVM metrics are secondary
+
+The monitoring stack (Prometheus + Grafana) had excellent infrastructure metrics (JVM heap,
+GC pauses, HikariCP pools, container CPU) but zero payment-specific metrics. You couldn't
+answer: "What's our current authorization success rate?" or "What's the confirm P99?"
+
+**Fix:** Added Micrometer counters and timers to `PaymentIntentService`:
+
+| Metric | Type | Tags |
+|--------|------|------|
+| `payment.intents.created` | Counter | — |
+| `payment.intents.confirm.duration` | Timer | P50, P95, P99 |
+| `payment.intents.capture.requested` | Counter | — |
+| `payment.webhooks.processed` | Counter | — |
+| `payment.intents.status_changes` | Counter | from, to |
+
+The confirm timer uses `Timer.start()` / `sample.stop(timer)` pattern to measure
+wall-clock time including lock acquisition, PCI service calls, and transaction commit.
+
+**Takeaway:** Infrastructure metrics tell you *how* the system is performing. Business
+metrics tell you *what* it's accomplishing. Both are necessary, but if you had to choose
+one, business metrics are more actionable — "auth success rate dropped 20%" is a clearer
+signal than "heap usage increased 10%".
+
+---
+
+## 53. Prometheus alerting rules — detect problems before users do
+
+Prometheus was scraping all services every 5s but had no alert rules. Problems were only
+discovered by running stress tests or reading logs.
+
+**Fix:** Created `infra/monitoring/alerts.yml` with rules for:
+- Confirm P99 latency > 5s (critical)
+- Auth success rate < 70% (warning)
+- Circuit breaker open > 1 minute (critical)
+- HikariCP pool > 90% active (warning)
+- HikariCP pending connections > 0 (critical)
+- PostgreSQL replication lag > 100MB (warning)
+- PostgreSQL cache hit ratio < 90% (warning)
+- JVM heap > 90% (warning)
+- Service down > 1 minute (critical)
+
+Wired into `prometheus.yml` via `rule_files` and mounted in docker-compose.
+
+**Takeaway:** Alerting rules encode operational knowledge. Each rule is a lesson from a
+past incident or stress test. Without alerts, the same problem has to be rediscovered
+by a human each time it occurs.
+
+---
+
+## 54. Webhook secret rotation requires dual-secret verification
+
+The HMAC webhook secret was a static string. Rotating it required simultaneously updating
+the gateway (signer) and the orchestrator (verifier) with zero downtime — a coordination
+problem with no safe window.
+
+**Fix:** `WebhookSignatureFilter` now accepts `gateway.webhook.secret.previous` and tries
+verification against both secrets. During rotation:
+1. Deploy orchestrator with both current and previous secrets
+2. Update the gateway to sign with the new secret
+3. Orchestrator verifies against new secret first, falls back to old
+4. After all gateways are updated, remove the previous secret
+
+The filter logs a warning when verification succeeds with the previous secret, indicating
+rotation is still in progress.
+
+**Takeaway:** Any HMAC-verified channel needs dual-key support for zero-downtime rotation.
+The verifier must accept signatures from both old and new keys during the transition
+period, with the signer switching atomically.
+
+---
+
+## 55. Dead letter events need automatic retry — manual retry doesn't scale
+
+Dead letter events were persisted but only retryable via a manual `POST /retry/{id}` API.
+At 300+ TPS, transient CDC failures (connection timeout, temporary deadlock) produce 30+
+dead letters per day. Manual retry via API calls is not operationally sustainable.
+
+**Fix:** Added `DeadLetterRetryScheduler` with exponential backoff:
+
+| Retry | Delay |
+|-------|-------|
+| 1 | 1 minute |
+| 2 | 5 minutes |
+| 3 | 30 minutes |
+| 4 | 2 hours |
+| 5 | 12 hours |
+
+After 5 retries, `next_retry_at` is set to null (stop retrying). The scheduler processes
+max 5 events per sweep to avoid thundering herd on reconnection after an outage.
+
+Migration adds `retry_count` and `next_retry_at` columns with an index for the scheduler
+query.
+
+**Takeaway:** Any event-driven system with a dead letter queue needs auto-retry with
+backoff. Manual retry APIs are for exceptional cases, not for transient failures. The
+backoff curve should match the expected recovery time of the most common failure modes.

@@ -31,7 +31,12 @@ class DeadLetterEvent(
     @Column(nullable = false)
     val createdAt: Instant = Instant.now(),
 
-    var resolvedAt: Instant? = null
+    var resolvedAt: Instant? = null,
+
+    @Column(nullable = false)
+    var retryCount: Int = 0,
+
+    var nextRetryAt: Instant? = Instant.now().plusSeconds(60)
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

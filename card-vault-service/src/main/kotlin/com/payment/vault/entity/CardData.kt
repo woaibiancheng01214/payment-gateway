@@ -25,6 +25,9 @@ class CardData(
     @Column(name = "cardholder_name")
     val cardholderName: String? = null,
 
+    @Column(name = "key_version", nullable = false)
+    val keyVersion: Int = 1,
+
     @Column(name = "created_at", nullable = false)
     val createdAt: Instant = Instant.now()
 ) {

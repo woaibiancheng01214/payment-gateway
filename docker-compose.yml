@@ -22,6 +22,8 @@ services:
         -c wal_buffers=16MB
         -c effective_cache_size=768MB
         -c random_page_cost=1.1
+        -c max_slot_wal_keep_size=2GB
+        -c wal_keep_size=256MB
     deploy:
       resources:
         limits:
@@ -291,6 +293,7 @@ services:
       - "9090:9090"
     volumes:
       - ./infra/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     depends_on:
       - cadvisor

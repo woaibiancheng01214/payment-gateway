@@ -8,6 +8,7 @@ import org.springframework.data.domain.Pageable
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Query
 import org.springframework.stereotype.Repository
+import java.time.Instant
 
 @Repository
 interface LedgerAccountRepository : JpaRepository<LedgerAccount, String> {
@@ -37,4 +38,14 @@ interface LedgerEntryRepository : JpaRepository<LedgerEntry, String> {
 interface DeadLetterEventRepository : JpaRepository<DeadLetterEvent, String> {
     fun findByResolvedAtIsNullOrderByCreatedAtDesc(pageable: Pageable): Page<DeadLetterEvent>
     fun findAllByOrderByCreatedAtDesc(pageable: Pageable): Page<DeadLetterEvent>
+
+    @Query("""
+        SELECT e FROM DeadLetterEvent e
+        WHERE e.resolvedAt IS NULL
+          AND e.nextRetryAt IS NOT NULL
+          AND e.nextRetryAt < :now
+          AND e.retryCount < :maxRetries
+        ORDER BY e.nextRetryAt ASC
+    """)
+    fun findRetryable(now: Instant, maxRetries: Int, pageable: Pageable): List<DeadLetterEvent>
 }

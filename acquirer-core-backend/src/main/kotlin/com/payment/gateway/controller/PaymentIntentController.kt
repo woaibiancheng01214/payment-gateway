@@ -58,4 +58,23 @@ class PaymentIntentController(
     ): ResponseEntity<Page<PaymentIntentResponse>> {
         return ResponseEntity.ok(paymentIntentService.listPaymentIntentsByMerchant(merchantId, pageable))
     }
+
+    // ── Cursor-based pagination (O(1) regardless of page depth) ────────────
+
+    @GetMapping("/cursor")
+    fun listCursor(
+        @RequestParam(name = "starting_after", required = false) startingAfter: String?,
+        @RequestParam(name = "limit", defaultValue = "20") limit: Int
+    ): ResponseEntity<PaymentIntentService.CursorPageResponse> {
+        return ResponseEntity.ok(paymentIntentService.listPaymentIntentsCursor(startingAfter, limit))
+    }
+
+    @GetMapping("/cursor/merchant/{merchantId}")
+    fun listByMerchantCursor(
+        @PathVariable merchantId: String,
+        @RequestParam(name = "starting_after", required = false) startingAfter: String?,
+        @RequestParam(name = "limit", defaultValue = "20") limit: Int
+    ): ResponseEntity<PaymentIntentService.CursorPageResponse> {
+        return ResponseEntity.ok(paymentIntentService.listPaymentIntentsByMerchantCursor(merchantId, startingAfter, limit))
+    }
 }

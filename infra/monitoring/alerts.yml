@@ -1,0 +1,95 @@
+groups:
+  - name: payment-gateway-alerts
+    rules:
+      # ── Latency ──────────────────────────────────────────────────────────
+      - alert: HighConfirmLatencyP99
+        expr: histogram_quantile(0.99, rate(payment_intents_confirm_duration_seconds_bucket[5m])) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Confirm P99 latency > 5s"
+          description: "Payment confirm P99 latency is {{ $value | humanizeDuration }} over the last 5 minutes."
+
+      # ── Authorization Success Rate ───────────────────────────────────────
+      - alert: LowAuthorizationRate
+        expr: >
+          (rate(payment_intents_status_changes_total{to="authorized"}[5m])
+          / (rate(payment_intents_status_changes_total{to="authorized"}[5m])
+             + rate(payment_intents_status_changes_total{to="failed"}[5m])))
+          < 0.7
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Authorization success rate < 70%"
+          description: "Auth success rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      # ── Circuit Breaker ──────────────────────────────────────────────────
+      - alert: CircuitBreakerOpen
+        expr: resilience4j_circuitbreaker_state{state="open"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker {{ $labels.name }} is OPEN"
+          description: "Circuit breaker {{ $labels.name }} on {{ $labels.instance }} has been open for > 1 minute."
+
+      # ── Connection Pool ──────────────────────────────────────────────────
+      - alert: HikariPoolNearExhaustion
+        expr: hikaricp_connections_active / hikaricp_connections_max > 0.9
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HikariCP pool > 90% active on {{ $labels.instance }}"
+          description: "{{ $labels.pool }} pool is at {{ $value | humanizePercentage }} utilization."
+
+      - alert: HikariPoolExhausted
+        expr: hikaricp_connections_pending > 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HikariCP has pending connection requests on {{ $labels.instance }}"
+          description: "{{ $labels.pool }} pool has {{ $value }} threads waiting for a connection."
+
+      # ── PostgreSQL ───────────────────────────────────────────────────────
+      - alert: PostgresReplicationLagHigh
+        expr: pg_replication_lag > 104857600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL replication lag > 100MB"
+          description: "Replication lag is {{ $value | humanize1024 }}B."
+
+      - alert: PostgresCacheHitRatioLow
+        expr: >
+          pg_stat_database_blks_hit{datname!~"template.*"}
+          / (pg_stat_database_blks_hit{datname!~"template.*"} + pg_stat_database_blks_read{datname!~"template.*"})
+          < 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL cache hit ratio < 90% on {{ $labels.datname }}"
+
+      # ── JVM ──────────────────────────────────────────────────────────────
+      - alert: HighHeapUsage
+        expr: jvm_memory_used_bytes{area="heap"} / jvm_memory_max_bytes{area="heap"} > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JVM heap usage > 90% on {{ $labels.instance }}"
+
+      # ── Service Health ───────────────────────────────────────────────────
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Prometheus target {{ $labels.instance }} has been unreachable for > 1 minute."

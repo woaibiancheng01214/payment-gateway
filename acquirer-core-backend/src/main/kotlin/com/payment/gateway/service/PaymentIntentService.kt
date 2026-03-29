@@ -5,6 +5,9 @@ import com.payment.gateway.dto.*
 import com.payment.gateway.entity.*
 import com.payment.gateway.repository.*
 import com.payment.gateway.util.HashUtils
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import org.slf4j.LoggerFactory
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.data.domain.Page
@@ -25,9 +28,20 @@ class PaymentIntentService(
     private val merchantClient: MerchantClient,
     private val lockManager: DistributedLockManager,
     private val objectMapper: ObjectMapper,
-    private val transactionTemplate: TransactionTemplate
+    private val transactionTemplate: TransactionTemplate,
+    private val meterRegistry: MeterRegistry
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
+
+    // ── Business metrics ───────────────────────────────────────────────────
+    private val createCounter = Counter.builder("payment.intents.created").register(meterRegistry)
+    private val confirmTimer = Timer.builder("payment.intents.confirm.duration")
+        .publishPercentiles(0.5, 0.95, 0.99).register(meterRegistry)
+    private val captureCounter = Counter.builder("payment.intents.capture.requested").register(meterRegistry)
+    private val webhookCounter = Counter.builder("payment.webhooks.processed").register(meterRegistry)
+    private fun statusChangeCounter(from: String, to: String) =
+        Counter.builder("payment.intents.status_changes")
+            .tag("from", from).tag("to", to).register(meterRegistry)
 
     // ── Create ──────────────────────────────────────────────────────────────
 
@@ -117,6 +131,7 @@ class PaymentIntentService(
         if (idempotencyKey != null && requestHash != null) {
             lockManager.redisSetIdem(idempotencyKey, requestHash, objectMapper.writeValueAsString(response))
         }
+        createCounter.increment()
         return response
     }
 
@@ -126,6 +141,7 @@ class PaymentIntentService(
         intentId: String,
         request: ConfirmPaymentIntentRequest
     ): PaymentIntentResponse {
+        val sample = Timer.start()
         val lockResult = lockManager.acquireLock(intentId)
 
         try {
@@ -185,12 +201,14 @@ class PaymentIntentService(
             return response
         } finally {
             lockManager.releaseLock(intentId, lockResult)
+            sample.stop(confirmTimer)
         }
     }
 
     // ── Capture ─────────────────────────────────────────────────────────────
 
     fun capturePaymentIntent(intentId: String): PaymentIntentResponse {
+        captureCounter.increment()
         val response = transactionTemplate.execute {
             val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                 .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
@@ -221,6 +239,7 @@ class PaymentIntentService(
 
     @Transactional
     fun handleWebhook(internalAttemptId: String, gatewayStatus: String) {
+        webhookCounter.increment()
         // Forward to auth-service to process InternalAttempt
         val result = authClient.processWebhook(internalAttemptId, gatewayStatus)
 
@@ -254,11 +273,13 @@ class PaymentIntentService(
             "success" -> {
                 attempt.status = PaymentAttemptStatus.AUTHORIZED
                 intent.status = PaymentIntentStatus.AUTHORIZED
+                statusChangeCounter("requires_confirmation", "authorized").increment()
                 log.info("PaymentIntent ${intent.id} authorized")
             }
             "failure" -> {
                 attempt.status = PaymentAttemptStatus.FAILED
                 intent.status = PaymentIntentStatus.FAILED
+                statusChangeCounter("requires_confirmation", "failed").increment()
                 log.info("PaymentIntent ${intent.id} failed")
             }
             else -> return
@@ -278,6 +299,7 @@ class PaymentIntentService(
                 intent.updatedAt = Instant.now()
                 paymentAttemptRepository.save(attempt)
                 paymentIntentRepository.save(intent)
+                statusChangeCounter("authorized", "captured").increment()
                 log.info("PaymentIntent ${intent.id} captured")
             }
             "failure" -> log.warn("Capture failed for PaymentIntent ${intent.id} — still authorized, retry is possible")
@@ -332,4 +354,48 @@ class PaymentIntentService(
         }
         return paymentIntentRepository.findByMerchantId(merchantId, pageable).map { it.toResponse() }
     }
+
+    // ── Cursor-based pagination ────────────────────────────────────────────
+
+    fun listPaymentIntentsCursor(startingAfter: String?, limit: Int): CursorPageResponse {
+        val pageSize = limit.coerceIn(1, 100)
+        val pageable = Pageable.ofSize(pageSize)
+
+        val intents = if (startingAfter != null) {
+            val cursor = paymentIntentRepository.findById(startingAfter)
+                .orElseThrow { IllegalArgumentException("Cursor intent not found: $startingAfter") }
+            paymentIntentRepository.findWithCursor(cursor.createdAt, cursor.id, pageable)
+        } else {
+            paymentIntentRepository.findAllByOrderByCreatedAtDescIdDesc(pageable)
+        }
+
+        val data = intents.map { it.toResponse() }
+        val hasMore = data.size == pageSize
+        return CursorPageResponse(data = data, hasMore = hasMore)
+    }
+
+    fun listPaymentIntentsByMerchantCursor(merchantId: String, startingAfter: String?, limit: Int): CursorPageResponse {
+        if (!merchantClient.merchantExists(merchantId)) {
+            throw IllegalArgumentException("Merchant not found: $merchantId")
+        }
+        val pageSize = limit.coerceIn(1, 100)
+        val pageable = Pageable.ofSize(pageSize)
+
+        val intents = if (startingAfter != null) {
+            val cursor = paymentIntentRepository.findById(startingAfter)
+                .orElseThrow { IllegalArgumentException("Cursor intent not found: $startingAfter") }
+            paymentIntentRepository.findByMerchantIdWithCursor(merchantId, cursor.createdAt, cursor.id, pageable)
+        } else {
+            paymentIntentRepository.findByMerchantIdOrdered(merchantId, pageable)
+        }
+
+        val data = intents.map { it.toResponse() }
+        val hasMore = data.size == pageSize
+        return CursorPageResponse(data = data, hasMore = hasMore)
+    }
+
+    data class CursorPageResponse(
+        val data: List<PaymentIntentResponse>,
+        val hasMore: Boolean
+    )
 }
