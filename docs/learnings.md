@@ -875,3 +875,118 @@ all events for replay after the fix.
 
 **Takeaway:** Any event-driven consumer that catches and logs errors is silently losing
 data. Persist failures to a dead-letter store and provide retry/query APIs.
+
+---
+
+## 31. Prometheus + Grafana > polling `docker stats` in a script
+
+The stress test already collected CPU, heap, and thread counts via Spring Boot Actuator
+during load. But those are point-in-time snapshots printed to stdout — no history, no
+visualization, no correlation across services.
+
+Adding Prometheus + Grafana + cAdvisor + postgres-exporter to docker-compose gave:
+
+- **Per-service JVM metrics** (Micrometer → `/actuator/prometheus`): heap used/committed/max,
+  GC pause rate, live thread count by state, HTTP request rate and P99 latency, HikariCP
+  active/pending/max connections, Tomcat busy threads.
+- **Per-container resource metrics** (cAdvisor): CPU %, memory usage and % of limit,
+  network RX/TX rate, filesystem I/O — for *every* container including Postgres, Redis, Kafka.
+- **PostgreSQL metrics** (postgres-exporter): active connections per database, transaction
+  commit/rollback rate, rows fetched/inserted/updated/deleted, locks by mode, cache hit ratio,
+  replication lag.
+
+The implementation required just two changes per service:
+1. `runtimeOnly("io.micrometer:micrometer-registry-prometheus")` in `build.gradle.kts`
+2. Add `prometheus` to `management.endpoints.web.exposure.include` in `application.properties`
+
+Three pre-built Grafana dashboards are auto-provisioned from JSON files via Grafana's
+provisioning API — no manual dashboard setup needed after `docker-compose up`.
+
+**Prometheus data persistence:** Without a Docker volume, Prometheus time-series data is
+lost on container restart. Adding `prometheus-data:/prometheus` as a named volume makes
+metrics survive `docker-compose down/up` (only cleared with `docker-compose down -v`).
+
+**Takeaway:** Real-time dashboards during stress tests reveal patterns that point-in-time
+snapshots miss — like a gradual connection pool fill-up or a CPU spike that correlates with
+GC pauses. The setup cost (4 containers + 1 dependency per service) pays for itself on
+the first load test.
+
+---
+
+## 32. Stress test thread coupling hides true system throughput
+
+The stress test targeted 100 TPS with 100 worker threads, each pacing at 1 request/second.
+But each thread did `create → confirm → sleep(remaining)` sequentially. Since confirm took
+P50=1452ms (synchronous RPC chain through vault → token → auth → gateway ACK), the
+thread's loop iteration took ~2.2s — cutting actual throughput to ~40 TPS (1288 intents
+in 30s instead of ~3000).
+
+**The fix:** Separate create and confirm into independent thread pools with a queue between
+them:
+
+```
+100 create threads ──→ Queue ──→ 100 confirm threads
+    (pace: 1/s each)              (drain as fast as possible)
+```
+
+Create threads pace at 1 TPS each and enqueue intent IDs. Confirm threads drain the queue
+independently. After this change, throughput jumped from 40 TPS to 76 TPS — the remaining
+gap from 100 TPS is genuine server-side latency, not test harness coupling.
+
+**Takeaway:** When a load test produces lower-than-expected throughput, check whether the
+test client is the bottleneck before blaming the server. Sequential request chaining in a
+single thread is a classic throughput limiter.
+
+---
+
+## 33. HikariCP pool sizing — match the pool to your actual concurrency
+
+With 200 concurrent threads (100 create + 100 confirm) hitting the backend, but only 50
+HikariCP connections, threads queue for a database connection. Create P50 jumped to 1107ms —
+a simple DB insert that should take <50ms was spending most of its time in the connection
+wait queue.
+
+The formula: if your sustained concurrency is N threads and each holds a connection for T
+seconds, you need at least N × T connections. With 200 threads and ~25ms average transaction
+time, 5 concurrent connections would suffice — but that assumes uniform arrivals. Under
+bursty load with lock contention (pessimistic writes hold connections longer), you need
+headroom. Increasing from 50 to 80 resolved the queuing.
+
+**Diagnosis clue:** If create latency (a simple INSERT) scales linearly with thread count
+but the actual query is fast, it's almost always connection pool exhaustion, not a slow
+query or missing index.
+
+**Takeaway:** Size HikariCP's `maximum-pool-size` for your peak concurrent *connection holders*,
+not your peak TPS. Account for pessimistic locks and long-running transactions holding
+connections longer than simple queries.
+
+---
+
+## 34. Synchronous RPC chains amplify latency non-linearly
+
+The confirm path traverses 6 synchronous HTTP hops:
+
+```
+checkout → vault(encrypt) → token(create) → auth-service → vault(read) → token(read) → gateway ACK
+```
+
+Each hop adds its own latency: network round-trip (~1ms in Docker), serialization (~1ms),
+and the actual work. The gateway ACK alone contributes P50=150ms (exponential distribution,
+floor 10ms, cap 2000ms). Multiplied across 6 hops under load, with thread-pool contention
+at each service, confirm P50 reached 2002ms.
+
+**Key insight:** Synchronous chains don't just *add* latencies — they *multiply* tail
+latency effects. If any single service in the chain is slow (GC pause, connection pool
+wait, thread exhaustion), the entire chain blocks. The probability of hitting at least one
+slow service grows with the number of hops.
+
+**The gateway's ACK delay is intentional simulation** (modeling real acquirer response
+times). Reducing `gateway.ack.cap-ms` from 2000 to 200 would bring confirm P50 down to
+~200ms but makes the simulation unrealistic. The current ~76 TPS with realistic gateway
+latency is a genuine measurement of system capacity under real-world conditions.
+
+**Takeaway:** Long synchronous RPC chains are the enemy of low-latency at scale. Each
+hop is a multiplier on tail latency. In production, consider: (a) parallelizing independent
+calls (vault + token could run concurrently), (b) async dispatch patterns where the
+response doesn't wait for downstream completion, (c) accepting that synchronous chains
+set a floor on P99 that scales with the chain length.

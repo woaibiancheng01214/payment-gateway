@@ -104,6 +104,21 @@ PCI zone services have **no external port mappings** — accessible only within 
 - **Schema migrations**: Use Flyway for all schema changes. Never use `ddl-auto=update`.
 - **Structured logging**: JSON logging via logstash-logback-encoder in Docker/prod profile. Plain text for local dev.
 
+## Monitoring
+
+Prometheus + Grafana stack runs alongside the services in Docker Compose:
+
+- **Grafana**: `http://localhost:3000` (admin/admin) — 3 pre-built dashboards (JVM, Docker containers, PostgreSQL)
+- **Prometheus**: `http://localhost:9090` — scrapes all services every 5s
+- **cAdvisor**: container CPU/memory/network metrics
+- **postgres-exporter**: PG connections, transactions, locks, cache hit ratio
+
+All Spring Boot services expose `/actuator/prometheus` via Micrometer.
+
+## Workflow Rules
+
+- **Update learnings before pushing**: When making significant changes (new features, bug fixes, performance tuning, architectural decisions), update `docs/learnings.md` with what was learned before committing and pushing. Each learning should explain the problem, the fix, and the takeaway.
+
 ## Service Health Checks
 
 ```bash
