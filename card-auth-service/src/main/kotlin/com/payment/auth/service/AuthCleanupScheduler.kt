@@ -2,6 +2,7 @@ package com.payment.auth.service
 
 import com.payment.auth.entity.*
 import com.payment.auth.repository.InternalAttemptRepository
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.scheduling.annotation.Scheduled
@@ -27,6 +28,7 @@ class AuthCleanupScheduler(
     private val log = LoggerFactory.getLogger(javaClass)
 
     @Scheduled(fixedDelayString = "\${payment.cleanup.interval-seconds:10}000")
+    @SchedulerLock(name = "sweepExpiredCaptureAttempts", lockAtMostFor = "9s", lockAtLeastFor = "5s")
     fun sweepExpiredCaptureAttempts() {
         val captureDeadline = Instant.now().minusSeconds(captureTimeoutSeconds)
         val staleCaptures = internalAttemptRepository.findStaleByTypeAndCreatedAtBefore(
@@ -58,6 +60,7 @@ class AuthCleanupScheduler(
     }
 
     @Scheduled(fixedDelayString = "\${payment.dispatch.retry-interval-seconds:3}000")
+    @SchedulerLock(name = "sweepUndispatchedAttempts", lockAtMostFor = "9s", lockAtLeastFor = "2s")
     fun sweepUndispatchedAttempts() {
         val staleThreshold = Instant.now().minusSeconds(dispatchStaleSeconds)
         val undispatched = internalAttemptRepository.findUndispatched(staleThreshold, batchSize)

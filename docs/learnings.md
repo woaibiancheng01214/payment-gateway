@@ -990,3 +990,124 @@ hop is a multiplier on tail latency. In production, consider: (a) parallelizing 
 calls (vault + token could run concurrently), (b) async dispatch patterns where the
 response doesn't wait for downstream completion, (c) accepting that synchronous chains
 set a floor on P99 that scales with the chain length.
+
+---
+
+## 35. When splitting a monolith, carry forward ALL patterns — not just structural ones
+
+Splitting `acquirer-core-backend` into `card-vault-service`, `token-service`, and
+`card-auth-service` replicated the *structural* patterns correctly: each service got
+Flyway, logback, OpenAPI, `GlobalExceptionHandler`, `ApiError`. But the *behavioral*
+patterns were left behind:
+
+| Pattern | acquirer-core-backend | New services |
+|---------|----------------------|-------------|
+| Input validation (`@Valid`, Bean Validation) | Yes | **Missing** |
+| Resilience4j circuit breakers on HTTP clients | Yes (DistributedLockManager) | **Missing** (GatewayClient, TokenClient, VaultClient all bare) |
+| ShedLock on `@Scheduled` | Yes | **Missing** (AuthCleanupScheduler ran on all instances) |
+| Idempotency-key support | Yes (create flow) | **Missing** |
+
+**Root cause:** The new services were built by extracting code, not by instantiating a
+template with all patterns pre-wired. The extraction focused on *what* the code does
+(encrypt, tokenize, dispatch) without carrying *how* the code protects itself.
+
+**Fix:** Added Bean Validation to all 4 new services, Resilience4j circuit breakers to
+all 3 RPC clients in `card-auth-service`, ShedLock to `AuthCleanupScheduler`, and a
+circuit breaker to `MerchantClient` in `acquirer-core-backend`.
+
+**Takeaway:** Treat cross-cutting concerns as a checklist when creating new services.
+Structural concerns (logging, migrations, error responses) are easy to remember because
+they cause immediate startup failures. Behavioral concerns (validation, resilience,
+distributed locking) only surface under load or failure — so they're forgotten until
+production blows up.
+
+---
+
+## 36. Internal APIs need validation too — defense in depth
+
+The initial assumption was: "These are internal services called only by our own code.
+The caller validates, so the callee doesn't need to." This is wrong for three reasons:
+
+1. **Callers evolve independently.** When `acquirer-core-backend` was refactored, a new
+   code path might forget to validate before calling `card-vault-service`. Without server-side
+   validation, an invalid PAN gets encrypted and stored — corrupting the vault.
+
+2. **Internal APIs may be exposed later.** The merchant-service started as internal-only
+   but got a public `/v1/merchants` controller. Without validation on the internal endpoint,
+   any code path that uses the internal API bypasses validation.
+
+3. **Defense in depth is a security principle, not overhead.** In payment systems, the
+   cost of processing invalid data (corrupted card records, ledger imbalances) far exceeds
+   the cost of a few `@Min`/`@NotBlank` annotations.
+
+**Specific bugs this would have caught:**
+- `card-vault-service` accepting `expMonth=13` or `expMonth=-1` → encrypted garbage
+- `token-service` silently defaulting invalid brand strings to `UNKNOWN` → misleading data
+- `card-auth-service` accepting `amount=0` or `amount=-100` → nonsensical authorization
+
+**Fix:** Added `@Valid` + Bean Validation constraints to every controller across all 4
+new services, and changed the token-service from silently defaulting to `CardBrand.UNKNOWN`
+to rejecting invalid brands with a 400 error.
+
+**Takeaway:** Validate at every service boundary, not just the external-facing one. The
+`@Valid` annotation costs one word per controller method; the protection is permanent.
+
+---
+
+## 37. Every outbound HTTP call needs a circuit breaker
+
+The `card-auth-service` confirm flow chains 3 HTTP calls:
+```
+auth-service → token-service.getPaymentMethodForAuth()
+auth-service → vault-service.getCardData()
+auth-service → gateway.authorize()
+```
+
+Without circuit breakers, if `token-service` goes down:
+1. Every confirm request waits 5s for the TCP timeout
+2. All 200 Tomcat threads fill up waiting for dead connections
+3. `card-auth-service` becomes unresponsive to ALL requests (including webhooks, captures)
+4. `acquirer-core-backend` cascades the failure (its `AuthClient` calls time out)
+5. The entire payment flow is dead
+
+With circuit breakers:
+1. After 5 failures in 10 calls, the circuit opens
+2. Subsequent calls fail immediately with `CircuitBreakerOpenException` (no 5s wait)
+3. `card-auth-service` stays responsive for other operations
+4. After 15s, the circuit tries `token-service` again (half-open state)
+
+The gateway client additionally gets a **bulkhead** (`maxConcurrentCalls=20`) because
+the gateway ACK latency is intentionally high (P50=150ms, cap 2000ms). Without a bulkhead,
+a burst of 200 concurrent dispatches would tie up 200 threads waiting for gateway ACKs.
+
+**Takeaway:** Circuit breakers protect the *caller*, not the callee. They prevent one
+failing dependency from consuming all resources and cascading to every other operation.
+Add them to every outbound HTTP call, even internal ones.
+
+---
+
+## 38. ShedLock must follow @Scheduled — they are inseparable
+
+`AuthCleanupScheduler` had two `@Scheduled` methods but no `@SchedulerLock`. In a
+3-replica deployment, this means:
+- 3 instances all run `sweepUndispatchedAttempts` every 3 seconds
+- Each finds the same undispatched `InternalAttempt` and dispatches it to the gateway
+- The gateway receives 3 identical requests, processes all 3, fires 3 webhooks
+- The checkout-service processes 3 webhooks — the terminal state guard prevents data
+  corruption, but the wasted work is 3x and the unnecessary webhook volume is 3x
+
+ShedLock prevents this by acquiring a database row lock before the scheduled method runs.
+Only the instance that wins the lock executes; others skip the cycle.
+
+```kotlin
+@Scheduled(fixedDelay = 3000)
+@SchedulerLock(name = "sweepUndispatchedAttempts", lockAtMostFor = "9s", lockAtLeastFor = "2s")
+fun sweepUndispatchedAttempts() { ... }
+```
+
+The `lockAtLeastFor` prevents rapid re-execution if the sweep completes in <100ms,
+avoiding wasteful tight loops. `lockAtMostFor` ensures the lock expires if the
+instance crashes mid-sweep.
+
+**Takeaway:** `@Scheduled` without `@SchedulerLock` is a bug in any multi-instance
+deployment. Treat them as an inseparable pair.

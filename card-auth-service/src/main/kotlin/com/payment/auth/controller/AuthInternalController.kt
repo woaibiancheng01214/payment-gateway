@@ -2,6 +2,7 @@ package com.payment.auth.controller
 
 import com.payment.auth.dto.*
 import com.payment.auth.service.AuthService
+import jakarta.validation.Valid
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -12,15 +13,15 @@ class AuthInternalController(
     private val authService: AuthService
 ) {
     @PostMapping("/confirm")
-    fun confirm(@RequestBody request: ConfirmRequest): ResponseEntity<ConfirmResponse> =
+    fun confirm(@Valid @RequestBody request: ConfirmRequest): ResponseEntity<ConfirmResponse> =
         ResponseEntity.status(HttpStatus.CREATED).body(authService.confirm(request))
 
     @PostMapping("/capture")
-    fun capture(@RequestBody request: CaptureRequest): ResponseEntity<CaptureResponse> =
+    fun capture(@Valid @RequestBody request: CaptureRequest): ResponseEntity<CaptureResponse> =
         ResponseEntity.status(HttpStatus.CREATED).body(authService.capture(request))
 
     @PostMapping("/webhook")
-    fun processWebhook(@RequestBody request: WebhookProcessRequest): ResponseEntity<WebhookProcessResponse> =
+    fun processWebhook(@Valid @RequestBody request: WebhookProcessRequest): ResponseEntity<WebhookProcessResponse> =
         ResponseEntity.ok(authService.processWebhook(request))
 
     @PostMapping("/expire")

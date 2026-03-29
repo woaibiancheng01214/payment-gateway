@@ -6,6 +6,7 @@ import com.payment.token.dto.PaymentMethodAuthResponse
 import com.payment.token.dto.PaymentMethodBriefResponse
 import com.payment.token.entity.CardBrand
 import com.payment.token.service.PaymentMethodService
+import jakarta.validation.Valid
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -18,12 +19,12 @@ class TokenInternalController(
 
     @PostMapping
     fun createPaymentMethod(
-        @RequestBody request: CreatePaymentMethodRequest
+        @Valid @RequestBody request: CreatePaymentMethodRequest
     ): ResponseEntity<CreatePaymentMethodResponse> {
         val brand = try {
             CardBrand.valueOf(request.brand.uppercase())
         } catch (e: IllegalArgumentException) {
-            CardBrand.UNKNOWN
+            throw IllegalArgumentException("Invalid card brand: ${request.brand}")
         }
         val id = paymentMethodService.createPaymentMethod(
             customerId = request.customerId,

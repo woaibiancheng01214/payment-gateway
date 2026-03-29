@@ -3,6 +3,10 @@ package com.payment.auth.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.payment.auth.entity.InternalAttempt
 import com.payment.auth.entity.InternalAttemptType
+import io.github.resilience4j.bulkhead.Bulkhead
+import io.github.resilience4j.bulkhead.BulkheadConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.web.client.RestTemplateBuilder
@@ -23,11 +27,34 @@ class GatewayClient(
         .setReadTimeout(Duration.ofSeconds(10))
         .build()
 
+    private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
+        "gatewayCircuitBreaker",
+        CircuitBreakerConfig.custom()
+            .slidingWindowSize(10)
+            .failureRateThreshold(50f)
+            .waitDurationInOpenState(Duration.ofSeconds(30))
+            .permittedNumberOfCallsInHalfOpenState(3)
+            .minimumNumberOfCalls(5)
+            .build()
+    )
+
+    private val bulkhead: Bulkhead = Bulkhead.of(
+        "gatewayBulkhead",
+        BulkheadConfig.custom()
+            .maxConcurrentCalls(20)
+            .maxWaitDuration(Duration.ofMillis(500))
+            .build()
+    )
+
     fun dispatch(internalAttempt: InternalAttempt) {
-        when (internalAttempt.type) {
-            InternalAttemptType.AUTH -> authorize(internalAttempt)
-            InternalAttemptType.CAPTURE -> capture(internalAttempt)
-        }
+        Bulkhead.decorateRunnable(bulkhead,
+            CircuitBreaker.decorateRunnable(circuitBreaker) {
+                when (internalAttempt.type) {
+                    InternalAttemptType.AUTH -> authorize(internalAttempt)
+                    InternalAttemptType.CAPTURE -> capture(internalAttempt)
+                }
+            }
+        ).run()
     }
 
     private fun authorize(internalAttempt: InternalAttempt) {

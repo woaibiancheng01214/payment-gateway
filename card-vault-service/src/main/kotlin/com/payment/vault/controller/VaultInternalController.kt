@@ -4,6 +4,7 @@ import com.payment.vault.dto.CardDataResponse
 import com.payment.vault.dto.CreateCardDataRequest
 import com.payment.vault.dto.CreateCardDataResponse
 import com.payment.vault.service.VaultService
+import jakarta.validation.Valid
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
@@ -19,7 +20,7 @@ class VaultInternalController(
     private val vaultService: VaultService
 ) {
     @PostMapping
-    fun createCardData(@RequestBody request: CreateCardDataRequest): ResponseEntity<CreateCardDataResponse> {
+    fun createCardData(@Valid @RequestBody request: CreateCardDataRequest): ResponseEntity<CreateCardDataResponse> {
         val cardDataId = vaultService.createCardData(
             pan = request.pan,
             expMonth = request.expMonth,
