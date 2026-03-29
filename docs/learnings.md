@@ -53,6 +53,11 @@ SHA-256(idempotency_key) → first 8 bytes → long → pg_advisory_xact_lock(lo
 **Takeaway:** Distributed idempotency needs a database-level serialization primitive, not
 application-level retry logic. Advisory locks are PostgreSQL's built-in answer to this.
 
+**Update (v8):** Advisory locks were later replaced by a two-tier approach:
+Redis `SET NX EX` for the fast path (checked via Resilience4j circuit breaker), with the
+DB unique constraint on `IdempotencyKey.key` as the source of truth. This eliminates the
+advisory lock's connection-holding cost while maintaining correctness. See Learning 23.
+
 ---
 
 ## 3. Commit first, dispatch after — the transactional outbox lesson
@@ -187,10 +192,10 @@ Every major bug was found by the stress test, not by reading code:
 | Gateway dedup set blocking retry scheduler | 3100 intents, 314 stuck at `requires_confirmation` |
 | Ledger debit/credit imbalance after CDC lag | Ledger consistency validation on 3000+ intents |
 
-The stress test evolved from 4 quick checks to 13 suites covering throughput, latency,
+The stress test evolved from 4 quick checks to 14 suites covering throughput, latency,
 race conditions, idempotency, state machine guards, data consistency, webhook replay,
-expiry, dispatch retry, sustained load with server metrics, and ledger double-entry
-consistency validation.
+expiry, dispatch retry, PCI architecture validation, sustained load with server metrics,
+and ledger double-entry consistency validation.
 
 **Takeaway:** Write the stress test early and run it after every change. The test will
 find bugs you'd never spot in code review.
@@ -275,6 +280,15 @@ v7: Ledger consistency validation + KRaft + observability
 
 Each version was driven by a specific failure found in testing, not by upfront design.
 The architecture emerged from concrete problems, not abstract principles.
+
+```
+v8: PCI service split + Resilience4j + Flyway + ShedLock + structured errors
+    → card-vault-service (AES-256-GCM PAN storage), token-service (payment methods),
+      card-auth-service (authorization orchestration). Circuit breaker + bulkhead for
+      Redis fallback. Flyway migrations replace ddl-auto=update. ShedLock prevents
+      duplicate scheduler runs. Input validation, API versioning (/v1/), OpenAPI docs,
+      structured JSON logging, dead-letter events for CDC failures.
+```
 
 ---
 
@@ -450,6 +464,11 @@ service with HSM-backed encryption, but the architecture is identical.
 and derive everything else (brand, last4) at tokenization time. The rest of the system
 should never need to detokenize.
 
+**Update (v8):** The in-memory `TokenVaultService` was replaced by three PCI-scoped services:
+`card-vault-service` (AES-256-GCM encrypted PAN in PostgreSQL), `token-service` (payment
+method references), and `card-auth-service` (authorization orchestration). These services
+have no external port mapping — accessible only within the Docker network. See Learning 22.
+
 ---
 
 ## 19. Enriching domain objects — what fields a PaymentIntent actually needs
@@ -532,3 +551,327 @@ ignored during deserialization. No code change required in the ledger service.
 **Takeaway:** CDC consumers should always use `ignoreUnknown = true` (or equivalent).
 Schema evolution in the source table is inevitable — consumers should be resilient to
 additive changes by default. Only opt into new fields when you actually need them.
+
+---
+
+## 22. PCI scope reduction through service boundaries, not just tokenization
+
+Learning 18 described in-memory tokenization. The next step was splitting card handling
+into dedicated PCI-scoped services with clear boundaries:
+
+```
+NON-PCI ZONE                          PCI ZONE (internal only)
+┌──────────────────────┐     RPC     ┌──────────────────┐
+│ acquirer-core-backend│────────────▶│ card-vault-service│ AES-256-GCM encrypted PAN
+│ (checkout-service)   │     RPC     │ token-service    │ PaymentMethod (brand, last4)
+│ port 8080, external  │────────────▶│ card-auth-service │ InternalAttempt + gateway dispatch
+└──────────────────────┘             └──────────────────┘
+                                      No host port mapping
+```
+
+**Key architectural decisions:**
+
+1. **PCI services have no external port mapping.** In docker-compose, the `card-vault-service`,
+   `token-service`, and `card-auth-service` have no `ports:` section. They're accessible only
+   within the Docker network by service name. This is enforced at the infrastructure level,
+   not application level.
+
+2. **Raw PAN still transits through the checkout-service** (accepted from browser over HTTPS)
+   but is immediately forwarded to `card-vault-service` and never persisted in the checkout DB.
+   Full client-side tokenization (Stripe.js-style iframe) would eliminate this transit entirely
+   — that's a future improvement.
+
+3. **Webhook routing stays at the checkout-service.** The external gateway sends webhooks to
+   the checkout-service (external-facing). The checkout-service forwards to `card-auth-service`
+   internally. This means the stress test's `signed_webhook_post()` still works without changes.
+
+4. **Each PCI service has its own database.** `card_vault`, `token_service`, `card_auth` are
+   separate PostgreSQL databases, each with their own Flyway migrations. This enforces data
+   isolation — the checkout-service cannot accidentally query raw card data.
+
+**Port conflict gotcha:** `card-vault-service` initially used port 8083, which collides with
+Debezium Connect's external port mapping. The stress test caught this — the "PCI service not
+exposed" check passed for token and auth but failed for vault. Changed to 8086.
+
+**Takeaway:** Service-level PCI boundary enforcement beats code-level trust. Even if a developer
+adds a debug endpoint to the checkout-service, it can't reach card data because it's in a
+different database behind a service that has no host port.
+
+---
+
+## 23. Resilience4j circuit breaker + bulkhead — the correct Redis fallback pattern
+
+The original Redis lock code had a dangerous fallback: if Redis was down, it silently
+proceeded as if the lock was acquired (fail-open). This defeats the entire purpose of
+distributed locking.
+
+**The fix: DistributedLockManager with three layers:**
+
+```
+Layer 1: Redis lock via Circuit Breaker
+  ↓ (if Redis down or CB open)
+Layer 2: DB-only locking via Bulkhead (max 5 concurrent)
+  ↓ (if Bulkhead full)
+Layer 3: 503 Service Unavailable
+```
+
+**Circuit Breaker** (`redisLockCircuitBreaker`): wraps all Redis operations. After 50% failure
+rate over 10 calls, the circuit opens and stops hitting Redis for 30 seconds. This prevents
+cascading failure — when Redis is down, we stop burning timeout waiting on dead connections.
+
+**Bulkhead** (`dbLockFallbackBulkhead`): limits concurrent DB-fallback requests to 5 per pod.
+Without this, all requests would fall back to DB pessimistic locking simultaneously,
+exhausting the HikariCP connection pool (50 connections, each held for the full lock duration).
+The bulkhead with `maxWaitDuration=0ms` means if 5 threads are already using DB fallback,
+the 6th gets rejected immediately with 503.
+
+**For the create flow (idempotency):** Redis is fail-open by design — the DB unique constraint
+is the source of truth. The circuit breaker just prevents wasting time on dead Redis connections.
+
+**For the confirm flow (distributed lock):** Redis is fail-safe — if Redis is unavailable,
+we fall back to DB-level `SELECT ... FOR UPDATE` gated by the bulkhead.
+
+```kotlin
+enum class LockSource { REDIS, DB_FALLBACK }
+data class LockResult(val lockValue: String?, val acquiredVia: LockSource)
+```
+
+The `releaseLock()` method only releases the Redis lock if it was acquired via Redis.
+DB locks are released automatically when the transaction commits.
+
+**Takeaway:** "Fall back to DB" sounds simple but has a hidden danger: if all requests
+simultaneously fall back to DB locking, the connection pool is the bottleneck. A bulkhead
+caps the fallback concurrency and fails fast for the rest.
+
+---
+
+## 24. ShedLock — single-instance scheduling in a stateless world
+
+Spring's `@Scheduled` runs on every application instance. With 3 replicas, the expiry
+scheduler runs 3x, each instance attempting to expire the same intents. The pessimistic
+lock prevents data corruption, but it wastes DB connections and creates unnecessary
+lock contention.
+
+**ShedLock** provides exactly-once scheduling via a database lock table:
+
+```sql
+CREATE TABLE shedlock (
+    name       VARCHAR(64)  PRIMARY KEY,
+    lock_until TIMESTAMP    NOT NULL,
+    locked_at  TIMESTAMP    NOT NULL,
+    locked_by  VARCHAR(255) NOT NULL
+);
+```
+
+```kotlin
+@Scheduled(fixedDelay = 10000)
+@SchedulerLock(name = "sweepExpiredAuthAttempts", lockAtMostFor = "9s", lockAtLeastFor = "5s")
+fun sweepExpiredAuthAttempts() { ... }
+```
+
+The `lockAtMostFor` (9s) < the `fixedDelay` (10s) ensures the lock always expires before the
+next scheduled invocation, preventing deadlocks if the locking instance crashes.
+`lockAtLeastFor` (5s) prevents rapid re-execution if the task completes quickly.
+
+**Takeaway:** Any scheduler that reads and mutates shared state should use distributed locking.
+ShedLock with JDBC is the simplest solution — no Redis dependency, no coordination protocol,
+just a database table with atomic upsert semantics.
+
+---
+
+## 25. Flyway migrations — why `ddl-auto=update` is a ticking time bomb
+
+Learning 20 described using `@Column(name)` to work around `ddl-auto=update`'s limitations.
+The real fix was switching to **Flyway**:
+
+- `ddl-auto=validate` (not `update`) — Hibernate checks schema alignment at startup without
+  modifying anything. If a migration is missing, the app fails fast instead of silently
+  creating a wonky schema.
+- Versioned SQL files (`V1__initial_schema.sql`, `V2__shedlock_table.sql`) provide an
+  auditable history of every schema change.
+- Each service has its own migration path because each service has its own database.
+
+**Gotcha with Spring Boot 3.2 + Flyway:** Spring Boot 3.2 ships with Flyway 9.x, which
+bundles PostgreSQL support in `flyway-core`. The separate `flyway-database-postgresql`
+artifact is only needed for Flyway 10+ (Spring Boot 3.3+). Adding it without a version
+causes a "could not resolve" build failure.
+
+**Takeaway:** Schema management is infrastructure, not application code. Let the migration
+tool own the DDL, and let Hibernate validate that the code matches.
+
+---
+
+## 26. Debezium timestamp formats depend on your column type and converter
+
+When the ledger consumer's `PaymentIntentSnapshot` added `created_at` and `updated_at`
+fields typed as `Long` (expecting epoch microseconds), every CDC event failed with:
+
+```
+Cannot deserialize value of type `java.lang.Long` from String "2026-03-29T07:48:14.927098Z"
+```
+
+**Root cause:** The Debezium connector uses `JsonConverter` with `schemas.enable=false`.
+For `TIMESTAMP WITH TIME ZONE` columns, the JSON converter serializes them as ISO 8601
+strings, not epoch microseconds. The `io.debezium.time.MicroTimestamp` representation
+only appears when using the Avro converter or `schemas.enable=true`.
+
+**Fix:** Changed the snapshot DTO to accept `String?` and added a `parseTimestamp()` method
+that handles both formats:
+
+```kotlin
+private fun parseTimestamp(value: String): Instant =
+    try { Instant.parse(value) }           // ISO string "2026-03-29T07:48:14Z"
+    catch (e: Exception) {
+        try {
+            val micros = value.toLong()     // Epoch microseconds
+            Instant.ofEpochSecond(micros / 1_000_000, (micros % 1_000_000) * 1_000)
+        } catch (e2: Exception) { Instant.now() }
+    }
+```
+
+This made the consumer resilient to converter changes — if someone later switches to Avro
+or enables schemas, the consumer still works.
+
+**Takeaway:** Never assume a specific serialization format for Debezium timestamps. The
+format depends on the column type, the converter, and the `schemas.enable` setting. Parse
+defensively.
+
+---
+
+## 27. Enums everywhere — bounded values should be types, not strings
+
+The original codebase used raw strings for currencies (`"USD"`), card brands (`"visa"`),
+and providers (`"mock-visa"`). This caused:
+
+- No compile-time validation — typos like `"usd"` vs `"USD"` pass silently
+- No IDE autocomplete or exhaustive `when` checking
+- The metadata table showed `"mock-visa"` strings that could diverge across services
+
+**The fix:** Kotlin enums for every bounded-value field:
+
+| Enum | Values | Used for |
+|---|---|---|
+| `Currency` | 30 ISO 4217 codes | PaymentIntent.currency, request validation |
+| `CardBrand` | VISA, MASTERCARD, AMEX, DISCOVER, JCB, UNIONPAY, UNKNOWN | PaymentAttempt.cardBrand, BIN detection |
+| `Provider` | MOCK_VISA, MOCK_MASTERCARD, MOCK_GENERIC | InternalAttempt.provider |
+| `PaymentMethodStatus` | ACTIVE, EXPIRED, DELETED | PaymentMethod lifecycle |
+
+The `Currency` enum includes a `fromString()` companion method that provides clear error
+messages: `"Unsupported currency: XYZ"` instead of a generic 500.
+
+**JPA mapping:** All enums use `@Enumerated(EnumType.STRING)` — stores the name as a string
+in the database, not the ordinal. This makes the data readable and survives enum reordering.
+
+**Takeaway:** If a field has a finite set of valid values, make it an enum. The cost is near
+zero (one enum class file) and the benefit is compile-time safety, IDE support, and
+self-documenting validation.
+
+---
+
+## 28. `data class` entities break JPA — use regular classes
+
+Kotlin `data class` is great for DTOs but harmful for JPA entities:
+
+- `equals()` includes all fields — including mutable ones like `status` and `updatedAt`.
+  This breaks `Set<Entity>` operations: after mutating `status`, the entity has a different
+  hash and can't be found in the set.
+- `hashCode()` changes when mutable fields change — same problem.
+- `toString()` includes all fields — triggers lazy-loading of relationships, causing
+  `LazyInitializationException` outside a session.
+- `copy()` creates detached copies that confuse Hibernate's first-level cache.
+
+**The fix:** Regular `class` with explicit `equals`/`hashCode` on `id` only:
+
+```kotlin
+@Entity
+class PaymentIntent(
+    @Id val id: String = UUID.randomUUID().toString(),
+    var status: PaymentIntentStatus = ...,
+    ...
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PaymentIntent) return false
+        return id == other.id
+    }
+    override fun hashCode(): Int = id.hashCode()
+}
+```
+
+This ensures identity-based equality (two entities with the same `id` are equal regardless
+of field values), stable hash codes, and no lazy-loading surprises.
+
+**Takeaway:** JPA entities are identity objects, not value objects. Use `class` + id-based
+equality. Reserve `data class` for DTOs and value types.
+
+---
+
+## 29. Structured error responses — machine-readable errors for API consumers
+
+The original error handling returned ad-hoc `Map<String, String>`:
+
+```kotlin
+ResponseEntity.badRequest().body(mapOf("error" to e.message))
+```
+
+This forces API consumers to parse arbitrary strings to understand what went wrong. No
+error codes, no field-level detail, no machine-readable categorization.
+
+**The fix:** A standard `ApiError` class + global `@ControllerAdvice`:
+
+```kotlin
+data class ApiError(
+    val type: String,      // "invalid_request_error", "conflict_error", "api_error"
+    val code: String,      // "amount_invalid", "currency_invalid", "state_conflict"
+    val message: String,   // Human-readable description
+    val param: String?     // Which field caused the error (for validation errors)
+)
+```
+
+The `@ControllerAdvice` handles all exception types consistently:
+- `IllegalArgumentException` → 400 + `invalid_request_error`
+- `IllegalStateException` → 409 + `conflict_error`
+- `MethodArgumentNotValidException` → 400 + field-level error from Bean Validation
+- `Exception` → 500 + generic `api_error` (with full stacktrace logged server-side)
+
+Per-controller `@ExceptionHandler` methods were removed — all error handling flows through
+one place.
+
+**Takeaway:** Error responses are part of your API contract. Define them as structured
+objects early. Adding `@ControllerAdvice` takes 30 minutes and saves every API consumer
+from guessing at error formats.
+
+---
+
+## 30. Dead-letter events — CDC failures must not be silently swallowed
+
+The original ledger consumer wrapped everything in try/catch and logged the error:
+
+```kotlin
+catch (e: Exception) {
+    log.error("Failed to process CDC event: ${e.message}", e)
+}
+```
+
+The Kafka offset still advances, so the failed event is lost forever. If the failure was
+transient (DB connection timeout), the event could have succeeded on retry. If it was
+permanent (schema mismatch), it needs manual investigation.
+
+**The fix:**
+
+1. **Persist failed events** to a `dead_letter_events` table with the full payload, error
+   message, and timestamps. This preserves the event even if the consumer moves on.
+
+2. **Expose a retry API:** `POST /v1/ledger/dead-letter-events/{id}/retry` re-processes
+   the original payload. If it succeeds, the event is marked as resolved. This enables
+   manual recovery after a transient issue is fixed.
+
+3. **Query API:** `GET /v1/ledger/dead-letter-events?unresolvedOnly=true` lists pending
+   failures for operations/debugging.
+
+The dead-letter table also catches the timestamp parsing bug from Learning 26 — when the
+`Long` vs `String` mismatch caused every CDC event to fail, the dead-letter table preserved
+all events for replay after the fix.
+
+**Takeaway:** Any event-driven consumer that catches and logs errors is silently losing
+data. Persist failures to a dead-letter store and provide retry/query APIs.
