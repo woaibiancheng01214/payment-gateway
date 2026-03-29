@@ -11,6 +11,7 @@ Usage:
 
 import sys
 import threading
+import queue
 import requests
 import time
 import uuid
@@ -1052,10 +1053,11 @@ def test_sustained_load():
     ids_lock = threading.Lock()
     metrics_snapshots = []
 
-    def worker():
-        """Each worker loops: create → confirm → sleep to ~1 TPS per thread."""
+    confirm_queue = queue.Queue()
+
+    def create_worker():
+        """Each worker loops: create → enqueue confirm → pace to 1 TPS."""
         while not stop_event.is_set():
-            iid = None
             try:
                 t0 = time.time()
                 r = requests.post(f"{BASE}/v1/payment_intents",
@@ -1064,12 +1066,31 @@ def test_sustained_load():
                 if r.status_code >= 500:
                     with ids_lock:
                         errors_5xx.append(("create", r.status_code))
-                    continue
-                r.raise_for_status()
-                iid = r.json()["id"]
-                with ids_lock:
-                    create_latencies.append(create_ms)
+                else:
+                    r.raise_for_status()
+                    iid = r.json()["id"]
+                    with ids_lock:
+                        create_latencies.append(create_ms)
+                        created_ids.append(iid)
+                    confirm_queue.put(iid)
 
+            except requests.exceptions.RequestException as e:
+                with ids_lock:
+                    errors_other.append(str(e)[:80])
+
+            elapsed = time.time() - t0
+            sleep_for = max(0, 1.0 - elapsed)
+            if not stop_event.is_set():
+                stop_event.wait(timeout=sleep_for)
+
+    def confirm_worker():
+        """Drains the confirm queue independently so creates are not blocked."""
+        while not stop_event.is_set() or not confirm_queue.empty():
+            try:
+                iid = confirm_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            try:
                 t1 = time.time()
                 r2 = requests.post(f"{BASE}/v1/payment_intents/{iid}/confirm",
                                    json=CARD_VISA,
@@ -1082,24 +1103,17 @@ def test_sustained_load():
                 else:
                     with ids_lock:
                         confirm_latencies.append(confirm_ms)
-
-                with ids_lock:
-                    created_ids.append(iid)
-
             except requests.exceptions.RequestException as e:
                 with ids_lock:
                     errors_other.append(str(e)[:80])
 
-            elapsed = time.time() - (t0 if 'iid' in dir() else time.time())
-            sleep_for = max(0, 1.0 - elapsed)
-            if not stop_event.is_set():
-                stop_event.wait(timeout=sleep_for)
-
     # ── Phase 1: Traffic ──────────────────────────────────────────────────
-    info(f"Starting {THREADS} worker threads for {DURATION_S}s...")
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(THREADS)]
+    CONFIRM_THREADS = 100  # separate pool to drain confirm queue without blocking creates
+    info(f"Starting {THREADS} create + {CONFIRM_THREADS} confirm threads for {DURATION_S}s...")
+    create_threads = [threading.Thread(target=create_worker, daemon=True) for _ in range(THREADS)]
+    confirm_threads = [threading.Thread(target=confirm_worker, daemon=True) for _ in range(CONFIRM_THREADS)]
     t_start = time.time()
-    for t in threads:
+    for t in create_threads + confirm_threads:
         t.start()
 
     last_metrics_t = time.time()
@@ -1120,7 +1134,9 @@ def test_sustained_load():
             last_metrics_t = time.time()
 
     stop_event.set()
-    for t in threads:
+    for t in create_threads:
+        t.join(timeout=15)
+    for t in confirm_threads:
         t.join(timeout=15)
     print()
 
