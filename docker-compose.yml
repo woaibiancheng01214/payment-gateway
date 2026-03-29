@@ -85,6 +85,73 @@ services:
       timeout: 3s
       retries: 10
 
+  # ── PCI Zone: Internal services (no host port mapping) ──────────────────
+
+  card-vault-service:
+    build:
+      context: ./card-vault-service
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/card_vault
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      VAULT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      SPRING_PROFILES_ACTIVE: docker
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  token-service:
+    build:
+      context: ./token-service
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/token_service
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_PROFILES_ACTIVE: docker
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  card-auth-service:
+    build:
+      context: ./card-auth-service
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      card-vault-service:
+        condition: service_started
+      token-service:
+        condition: service_started
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/card_auth
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      GATEWAY_SERVER_URL: http://external-payment-gateway:8081
+      GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/v1/webhooks/gateway
+      TOKEN_SERVICE_URL: http://token-service:8084
+      VAULT_SERVICE_URL: http://card-vault-service:8086
+      SPRING_PROFILES_ACTIVE: docker
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  # ── Non-PCI Zone: External-facing services ──────────────────────────────
+
   acquirer-core-backend:
     build:
       context: ./acquirer-core-backend
@@ -94,6 +161,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      card-vault-service:
+        condition: service_started
+      token-service:
+        condition: service_started
+      card-auth-service:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
@@ -101,10 +174,14 @@ services:
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
       GATEWAY_SERVER_URL: http://external-payment-gateway:8081
-      GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/webhooks/gateway
+      GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/v1/webhooks/gateway
       GATEWAY_WEBHOOK_SECRET: payment-gateway-webhook-secret-2026
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
+      VAULT_SERVICE_URL: http://card-vault-service:8086
+      TOKEN_SERVICE_URL: http://token-service:8084
+      AUTH_SERVICE_URL: http://card-auth-service:8085
+      SPRING_PROFILES_ACTIVE: docker
     deploy:
       resources:
         limits:
@@ -122,6 +199,7 @@ services:
       - "8081:8081"
     environment:
       GATEWAY_WEBHOOK_SECRET: payment-gateway-webhook-secret-2026
+      SPRING_PROFILES_ACTIVE: docker
     deploy:
       resources:
         limits:
@@ -144,6 +222,7 @@ services:
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_PROFILES_ACTIVE: docker
     deploy:
       resources:
         limits:
@@ -173,3 +252,11 @@ services:
 
 volumes:
   pgdata:
+
+secrets:
+  db_password:
+    file: ./infra/secrets/db_password.txt
+  webhook_secret:
+    file: ./infra/secrets/webhook_secret.txt
+  vault_encryption_key:
+    file: ./infra/secrets/vault_encryption_key.txt

@@ -49,7 +49,7 @@ class WebhookSignatureFilter(
     private val log = LoggerFactory.getLogger(javaClass)
 
     override fun shouldNotFilter(request: HttpServletRequest): Boolean =
-        !request.requestURI.startsWith("/webhooks/")
+        !request.requestURI.startsWith("/v1/webhooks/")
 
     override fun doFilterInternal(
         request: HttpServletRequest,

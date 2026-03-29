@@ -10,7 +10,6 @@ enum class PaymentIntentStatus {
     AUTHORIZED,
     CAPTURED,
     FAILED,
-    /** Auth webhook never arrived within the configured timeout window. Terminal — cannot recover. */
     EXPIRED
 }
 
@@ -21,15 +20,16 @@ enum class PaymentIntentStatus {
         Index(name = "idx_pi_status_updated", columnList = "status, updatedAt")
     ]
 )
-data class PaymentIntent(
+class PaymentIntent(
     @Id
     val id: String = UUID.randomUUID().toString(),
 
     @Column(nullable = false)
     val amount: Long,
 
+    @Enumerated(EnumType.STRING)
     @Column(nullable = false)
-    val currency: String,
+    val currency: Currency,
 
     @Column(columnDefinition = "TEXT")
     val description: String? = null,
@@ -53,4 +53,14 @@ data class PaymentIntent(
 
     @Column(nullable = false)
     var updatedAt: Instant = Instant.now()
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PaymentIntent) return false
+        return id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
+
+    override fun toString(): String = "PaymentIntent(id=$id, status=$status, amount=$amount, currency=$currency)"
+}

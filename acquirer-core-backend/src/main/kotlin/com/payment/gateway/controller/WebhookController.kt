@@ -7,7 +7,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/webhooks")
+@RequestMapping("/v1/webhooks")
 class WebhookController(
     private val paymentIntentService: PaymentIntentService
 ) {
@@ -19,8 +19,4 @@ class WebhookController(
         paymentIntentService.handleWebhook(request.internalAttemptId, request.status)
         return ResponseEntity.ok(mapOf("received" to "true"))
     }
-
-    @ExceptionHandler(IllegalArgumentException::class)
-    fun handleBadRequest(e: IllegalArgumentException): ResponseEntity<Map<String, String>> =
-        ResponseEntity.badRequest().body(mapOf("error" to (e.message ?: "Bad request")))
 }

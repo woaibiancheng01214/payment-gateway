@@ -5,7 +5,7 @@ import java.time.Instant
 
 @Entity
 @Table(name = "idempotency_keys")
-data class IdempotencyKey(
+class IdempotencyKey(
     @Id
     val key: String,
 
@@ -17,4 +17,14 @@ data class IdempotencyKey(
 
     @Column(nullable = false)
     val createdAt: Instant = Instant.now()
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is IdempotencyKey) return false
+        return key == other.key
+    }
+
+    override fun hashCode(): Int = key.hashCode()
+
+    override fun toString(): String = "IdempotencyKey(key=$key)"
+}

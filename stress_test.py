@@ -69,7 +69,7 @@ def signed_webhook_post(internal_attempt_id: str, status: str, timeout: int = 5)
         WEBHOOK_SECRET.encode(), f"{timestamp}.{body}".encode(), hashlib.sha256
     ).hexdigest()
     return requests.post(
-        f"{BASE}/webhooks/gateway",
+        f"{BASE}/v1/webhooks/gateway",
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -90,7 +90,7 @@ def rand_currency():
 def create_intent(amount=None, currency=None) -> dict:
     amount = amount or rand_amount()
     currency = currency or rand_currency()
-    r = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency}, timeout=10)
+    r = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency}, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -103,15 +103,15 @@ CARD_VISA = {
 }
 
 def confirm_intent(intent_id, card_data=None) -> requests.Response:
-    return requests.post(f"{BASE}/payment_intents/{intent_id}/confirm",
+    return requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
                          json=card_data or CARD_VISA,
                          headers={"Content-Type": "application/json"}, timeout=15)
 
 def capture_intent(intent_id) -> requests.Response:
-    return requests.post(f"{BASE}/payment_intents/{intent_id}/capture", timeout=15)
+    return requests.post(f"{BASE}/v1/payment_intents/{intent_id}/capture", timeout=15)
 
 def get_intent(intent_id) -> dict:
-    r = requests.get(f"{BASE}/payment_intents/{intent_id}", timeout=10)
+    r = requests.get(f"{BASE}/v1/payment_intents/{intent_id}", timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -233,14 +233,14 @@ def test_idempotency_correctness():
     amount = rand_amount()
     currency = rand_currency()
 
-    r1 = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+    r1 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
                        headers={"Idempotency-Key": key}, timeout=10)
     r1.raise_for_status()
     first_id = r1.json()["id"]
     ok(f"First create: id={first_id}")
 
     # Replay — same key, same payload → should return cached response
-    r2 = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+    r2 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
                        headers={"Idempotency-Key": key}, timeout=10)
     if r2.status_code in (200, 201) and r2.json()["id"] == first_id:
         ok("Replay returns same cached response")
@@ -248,7 +248,7 @@ def test_idempotency_correctness():
         record_issue("CRITICAL", "idempotency", f"Replay failed: {r2.status_code} {r2.text}")
 
     # Same key, different payload → should be rejected
-    r3 = requests.post(f"{BASE}/payment_intents", json={"amount": amount + 1, "currency": currency},
+    r3 = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount + 1, "currency": currency},
                        headers={"Idempotency-Key": key}, timeout=10)
     if r3.status_code == 400:
         ok("Different payload with same key correctly rejected (400)")
@@ -259,7 +259,7 @@ def test_idempotency_correctness():
     # Concurrent replays — all should return the same response
     replay_results = []
     def replay():
-        r = requests.post(f"{BASE}/payment_intents", json={"amount": amount, "currency": currency},
+        r = requests.post(f"{BASE}/v1/payment_intents", json={"amount": amount, "currency": currency},
                           headers={"Idempotency-Key": key}, timeout=10)
         with LOCK:
             replay_results.append(r.json().get("id"))
@@ -714,6 +714,89 @@ def test_dispatch_retry():
                 info(f"  {iid[:8]}… → {d['status']} | IA status={internals[0]['status']}")
 
 
+def test_pci_service_architecture():
+    """
+    Validates the PCI service split:
+    1. Confirm flow goes through vault → token → auth services (verified by detail view)
+    2. Internal PCI services are not reachable from host network
+    3. Dead-letter events API is accessible
+    4. Swagger / OpenAPI docs are available
+    """
+    print(f"\n{BOLD}── Test 13: PCI Service Architecture Validation ──{RESET}")
+
+    # 1. Full flow: create → confirm → verify detail view has paymentMethodId (not raw PAN)
+    intent = create_intent(amount=7777, currency="USD")
+    iid = intent["id"]
+    r = confirm_intent(iid)
+    assert r.status_code == 200, f"Confirm failed: {r.status_code} {r.text[:200]}"
+
+    detail = get_intent(iid)
+    assert len(detail["attempts"]) == 1, f"Expected 1 attempt, got {len(detail['attempts'])}"
+    attempt = detail["attempts"][0]
+
+    # paymentMethodId should be a pm_ prefixed token, NOT a raw card number
+    pm_id = attempt["paymentMethodId"]
+    assert pm_id.startswith("pm_"), f"Expected pm_ prefixed paymentMethodId, got: {pm_id}"
+    ok(f"PaymentMethodId is tokenized: {pm_id[:20]}...")
+
+    # cardBrand should be set (derived from BIN)
+    assert attempt["cardBrand"] is not None, "cardBrand is None"
+    assert attempt["cardBrand"] == "visa", f"Expected visa brand, got: {attempt['cardBrand']}"
+    ok(f"Card brand correctly derived: {attempt['cardBrand']}")
+
+    # last4 should be set
+    assert attempt["last4"] == "4242", f"Expected last4=4242, got: {attempt['last4']}"
+    ok(f"Last4 correctly stored: {attempt['last4']}")
+
+    # 2. Verify PCI services are NOT accessible from host
+    for port, name in [(8086, "card-vault-service"), (8084, "token-service"), (8085, "card-auth-service")]:
+        try:
+            r = requests.get(f"http://localhost:{port}/actuator/health", timeout=2)
+            # If we get here, the port is accessible — that's wrong
+            record_issue("WARNING", "pci_architecture",
+                         f"{name} (port {port}) is accessible from host — should be internal-only")
+        except requests.exceptions.ConnectionError:
+            ok(f"{name} (port {port}) correctly not exposed to host")
+        except requests.exceptions.ReadTimeout:
+            ok(f"{name} (port {port}) correctly not exposed to host (timeout)")
+
+    # 3. Dead-letter events API
+    try:
+        r = requests.get(f"{LEDGER_BASE}/v1/ledger/dead-letter-events", timeout=5)
+        assert r.status_code == 200, f"Dead-letter API returned {r.status_code}"
+        ok(f"Dead-letter events API accessible (status={r.status_code})")
+    except Exception as e:
+        record_issue("WARNING", "dead_letter_api", f"Dead-letter API failed: {e}")
+
+    # 4. Swagger / OpenAPI docs
+    for port, name in [(8080, "checkout"), (8081, "gateway"), (8082, "ledger")]:
+        try:
+            r = requests.get(f"http://localhost:{port}/api-docs", timeout=5)
+            if r.status_code == 200:
+                ok(f"OpenAPI docs available for {name} (port {port})")
+            else:
+                warn(f"OpenAPI docs returned {r.status_code} for {name}")
+        except Exception:
+            warn(f"OpenAPI docs not available for {name}")
+
+    # 5. Input validation: test that invalid requests are rejected with structured errors
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"amount": -100, "currency": "INVALID"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for invalid input, got {r.status_code}"
+    error_body = r.json()
+    assert "type" in error_body, f"Expected structured error with 'type' field, got: {error_body}"
+    assert "code" in error_body, f"Expected structured error with 'code' field, got: {error_body}"
+    ok(f"Invalid input correctly rejected with structured error: type={error_body['type']}, code={error_body['code']}")
+
+    # 6. Verify currency enum validation
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"amount": 100, "currency": "XYZ"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for invalid currency, got {r.status_code}"
+    ok("Invalid currency 'XYZ' correctly rejected")
+
+
 def fetch_server_metrics(base_url, label):
     """Fetch CPU, memory, and thread metrics from a Spring Boot Actuator endpoint."""
     metrics = {}
@@ -774,7 +857,7 @@ def print_metrics_snapshot(phase_label):
 
 def get_ledger_entries(intent_id) -> list:
     try:
-        r = requests.get(f"{LEDGER_BASE}/ledger/entries", params={"paymentIntentId": intent_id}, timeout=10)
+        r = requests.get(f"{LEDGER_BASE}/v1/ledger/entries", params={"paymentIntentId": intent_id}, timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -784,7 +867,7 @@ def get_ledger_entries(intent_id) -> list:
 
 def get_ledger_balances() -> dict:
     try:
-        r = requests.get(f"{LEDGER_BASE}/ledger/balances", timeout=10)
+        r = requests.get(f"{LEDGER_BASE}/v1/ledger/balances", timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -830,7 +913,7 @@ def test_ledger_consistency():
     # 2. Per-intent entry validation (sample recent intents)
     info(f"Sampling {SAMPLE_SIZE} intents for per-intent ledger validation...")
     try:
-        r = requests.get(f"{BASE}/payment_intents", params={"size": SAMPLE_SIZE}, timeout=10)
+        r = requests.get(f"{BASE}/v1/payment_intents", params={"size": SAMPLE_SIZE}, timeout=10)
         r.raise_for_status()
         page = r.json()
         all_intents = page.get("content", page) if isinstance(page, dict) else page
@@ -975,7 +1058,7 @@ def test_sustained_load():
             iid = None
             try:
                 t0 = time.time()
-                r = requests.post(f"{BASE}/payment_intents",
+                r = requests.post(f"{BASE}/v1/payment_intents",
                                   json={"amount": rand_amount(), "currency": rand_currency()}, timeout=10)
                 create_ms = (time.time() - t0) * 1000
                 if r.status_code >= 500:
@@ -988,7 +1071,7 @@ def test_sustained_load():
                     create_latencies.append(create_ms)
 
                 t1 = time.time()
-                r2 = requests.post(f"{BASE}/payment_intents/{iid}/confirm",
+                r2 = requests.post(f"{BASE}/v1/payment_intents/{iid}/confirm",
                                    json=CARD_VISA,
                                    headers={"Content-Type": "application/json"},
                                    timeout=10)
@@ -1322,6 +1405,7 @@ if __name__ == "__main__":
             test_expiry_auth_hang,
             test_expiry_blocks_late_webhook,
             test_dispatch_retry,
+            test_pci_service_architecture,
             test_sustained_load,
             test_ledger_consistency,
         ]

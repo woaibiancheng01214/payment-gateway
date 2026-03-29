@@ -2,6 +2,7 @@ package com.payment.gateway.controller
 
 import com.payment.gateway.dto.*
 import com.payment.gateway.service.PaymentIntentService
+import jakarta.validation.Valid
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
 import org.springframework.data.web.PageableDefault
@@ -10,14 +11,14 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/payment_intents")
+@RequestMapping("/v1/payment_intents")
 class PaymentIntentController(
     private val paymentIntentService: PaymentIntentService
 ) {
 
     @PostMapping
     fun create(
-        @RequestBody request: CreatePaymentIntentRequest,
+        @Valid @RequestBody request: CreatePaymentIntentRequest,
         @RequestHeader("Idempotency-Key", required = false) idempotencyKey: String?
     ): ResponseEntity<PaymentIntentResponse> {
         val response = paymentIntentService.createPaymentIntent(request, idempotencyKey)
@@ -27,7 +28,7 @@ class PaymentIntentController(
     @PostMapping("/{id}/confirm")
     fun confirm(
         @PathVariable id: String,
-        @RequestBody request: ConfirmPaymentIntentRequest
+        @Valid @RequestBody request: ConfirmPaymentIntentRequest
     ): ResponseEntity<PaymentIntentResponse> {
         val response = paymentIntentService.confirmPaymentIntent(id, request)
         return ResponseEntity.ok(response)
@@ -49,12 +50,4 @@ class PaymentIntentController(
     fun list(@PageableDefault(size = 20) pageable: Pageable): ResponseEntity<Page<PaymentIntentResponse>> {
         return ResponseEntity.ok(paymentIntentService.listPaymentIntents(pageable))
     }
-
-    @ExceptionHandler(IllegalArgumentException::class)
-    fun handleBadRequest(e: IllegalArgumentException): ResponseEntity<Map<String, String>> =
-        ResponseEntity.badRequest().body(mapOf("error" to (e.message ?: "Bad request")))
-
-    @ExceptionHandler(IllegalStateException::class)
-    fun handleConflict(e: IllegalStateException): ResponseEntity<Map<String, String>> =
-        ResponseEntity.status(HttpStatus.CONFLICT).body(mapOf("error" to (e.message ?: "Conflict")))
 }

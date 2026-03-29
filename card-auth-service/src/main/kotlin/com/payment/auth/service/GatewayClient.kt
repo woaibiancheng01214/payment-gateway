@@ -1,8 +1,8 @@
-package com.payment.gateway.service
+package com.payment.auth.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.payment.gateway.entity.InternalAttempt
-import com.payment.gateway.entity.InternalAttemptType
+import com.payment.auth.entity.InternalAttempt
+import com.payment.auth.entity.InternalAttemptType
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.web.client.RestTemplateBuilder
@@ -15,7 +15,7 @@ class GatewayClient(
     private val objectMapper: ObjectMapper,
     restTemplateBuilder: RestTemplateBuilder,
     @Value("\${gateway.server.url:http://localhost:8081}") private val gatewayUrl: String,
-    @Value("\${gateway.callback.url:http://localhost:8080/webhooks/gateway}") private val callbackUrl: String
+    @Value("\${gateway.callback.url:http://localhost:8080/v1/webhooks/gateway}") private val callbackUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
     private val http: RestTemplate = restTemplateBuilder
@@ -41,16 +41,19 @@ class GatewayClient(
             "callbackUrl" to callbackUrl
         )
         http.postForEntity("$gatewayUrl/v1/authorize", body, Map::class.java)
-        log.info("AUTH dispatched to gateway-server for attempt ${internalAttempt.id}")
+        log.info("AUTH dispatched to gateway for attempt ${internalAttempt.id}")
     }
 
     private fun capture(internalAttempt: InternalAttempt) {
+        val payload = parsePayload(internalAttempt.requestPayload)
         val body = mapOf(
             "internalAttemptId" to internalAttempt.id,
+            "amount" to (payload["amount"] ?: 0L),
+            "currency" to (payload["currency"] ?: "USD"),
             "callbackUrl" to callbackUrl
         )
         http.postForEntity("$gatewayUrl/v1/capture", body, Map::class.java)
-        log.info("CAPTURE dispatched to gateway-server for attempt ${internalAttempt.id}")
+        log.info("CAPTURE dispatched to gateway for attempt ${internalAttempt.id}")
     }
 
     @Suppress("UNCHECKED_CAST")

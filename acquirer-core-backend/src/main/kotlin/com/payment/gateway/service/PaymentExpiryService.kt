@@ -8,42 +8,29 @@ import org.springframework.transaction.annotation.Propagation
 import org.springframework.transaction.annotation.Transactional
 import java.time.Instant
 
-/**
- * Handles per-record expiry in its own transactions.
- * Lives in a separate bean from PaymentCleanupScheduler so that
- * Spring's proxy can apply @Transactional(REQUIRES_NEW) on each
- * call, preventing a single failure from rolling back the whole sweep.
- */
 @Service
 class PaymentExpiryService(
     private val paymentIntentRepository: PaymentIntentRepository,
     private val paymentAttemptRepository: PaymentAttemptRepository,
-    private val internalAttemptRepository: InternalAttemptRepository
+    private val authClient: AuthClient
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    /**
-     * Expires one auth-hung intent. Returns true if it was actually expired,
-     * false if a concurrent webhook already resolved it.
-     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     fun expireAuthIntent(intentId: String): Boolean {
         val intent = paymentIntentRepository.findByIdForUpdate(intentId).orElse(null) ?: return false
 
-        // Re-check under lock — webhook may have resolved it while we waited for the lock
         if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) return false
 
         val attempts = paymentAttemptRepository.findByPaymentIntentId(intentId)
         log.warn("Expiring auth-hung intent $intentId (stuck since ${intent.updatedAt})")
         val now = Instant.now()
 
+        // Expire InternalAttempts via auth-service
+        val attemptIds = attempts.filter { it.status == PaymentAttemptStatus.PENDING }.map { it.id }
+        authClient.expireAttempts(attemptIds)
+
         for (attempt in attempts.filter { it.status == PaymentAttemptStatus.PENDING }) {
-            for (ia in internalAttemptRepository.findByPaymentAttemptId(attempt.id)
-                .filter { it.status in setOf(InternalAttemptStatus.PENDING, InternalAttemptStatus.TIMEOUT) }) {
-                ia.status = InternalAttemptStatus.EXPIRED
-                ia.updatedAt = now
-                internalAttemptRepository.save(ia)
-            }
             attempt.status = PaymentAttemptStatus.EXPIRED
             attempt.updatedAt = now
             paymentAttemptRepository.save(attempt)
@@ -53,16 +40,5 @@ class PaymentExpiryService(
         intent.updatedAt = now
         paymentIntentRepository.save(intent)
         return true
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    fun expireCaptureAttemptsBatch(batch: List<InternalAttempt>) {
-        val now = Instant.now()
-        for (ia in batch) {
-            log.warn("Expiring capture-hung InternalAttempt ${ia.id} (created ${ia.createdAt}) — intent stays AUTHORIZED for retry")
-            ia.status = InternalAttemptStatus.EXPIRED
-            ia.updatedAt = now
-            internalAttemptRepository.save(ia)
-        }
     }
 }

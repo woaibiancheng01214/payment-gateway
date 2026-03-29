@@ -1,7 +1,10 @@
 package com.payment.ledger.repository
 
+import com.payment.ledger.entity.DeadLetterEvent
 import com.payment.ledger.entity.LedgerAccount
 import com.payment.ledger.entity.LedgerEntry
+import org.springframework.data.domain.Page
+import org.springframework.data.domain.Pageable
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Query
 import org.springframework.stereotype.Repository
@@ -28,4 +31,10 @@ interface LedgerEntryRepository : JpaRepository<LedgerEntry, String> {
         GROUP BY a.name, e.entryType
     """)
     fun findBalancesWithAccountName(): List<Array<Any>>
+}
+
+@Repository
+interface DeadLetterEventRepository : JpaRepository<DeadLetterEvent, String> {
+    fun findByResolvedAtIsNullOrderByCreatedAtDesc(pageable: Pageable): Page<DeadLetterEvent>
+    fun findAllByOrderByCreatedAtDesc(pageable: Pageable): Page<DeadLetterEvent>
 }

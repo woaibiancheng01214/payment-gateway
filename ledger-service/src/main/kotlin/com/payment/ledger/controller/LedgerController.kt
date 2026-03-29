@@ -6,7 +6,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/ledger")
+@RequestMapping("/v1/ledger")
 class LedgerController(
     private val ledgerService: LedgerService
 ) {

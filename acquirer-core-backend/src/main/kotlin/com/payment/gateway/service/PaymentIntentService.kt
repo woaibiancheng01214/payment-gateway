@@ -9,129 +9,45 @@ import org.slf4j.LoggerFactory
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
-import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.support.TransactionTemplate
-import java.time.Duration
 import java.time.Instant
-import java.util.UUID
 
 @Service
 class PaymentIntentService(
     private val paymentIntentRepository: PaymentIntentRepository,
     private val paymentAttemptRepository: PaymentAttemptRepository,
-    private val internalAttemptRepository: InternalAttemptRepository,
     private val idempotencyKeyRepository: IdempotencyKeyRepository,
-    private val gatewayClient: GatewayClient,
-    private val dispatchMarkService: DispatchMarkService,
-    private val tokenVaultService: TokenVaultService,
+    private val vaultClient: VaultClient,
+    private val tokenClient: TokenClient,
+    private val authClient: AuthClient,
+    private val lockManager: DistributedLockManager,
     private val objectMapper: ObjectMapper,
-    private val transactionTemplate: TransactionTemplate,
-    private val redisTemplate: StringRedisTemplate
+    private val transactionTemplate: TransactionTemplate
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    companion object {
-        private const val IDEM_PREFIX = "idempotency:"
-        private const val LOCK_PREFIX = "lock:intent:"
-        private val IDEM_TTL = Duration.ofHours(24)
-        private val LOCK_TTL = Duration.ofSeconds(30)
-    }
-
-    // ── Redis idempotency cache (for create) ────────────────────────────────
-
-    /**
-     * Redis cache entry format: "requestHash\nresponseJson".
-     * The hash is stored alongside the response so a Redis hit can detect payload
-     * mismatches without falling through to the DB.
-     */
-    private fun redisGetIdem(key: String, requestHash: String): String? {
-        val raw = try { redisTemplate.opsForValue().get(IDEM_PREFIX + key) }
-                  catch (e: Exception) { log.warn("Redis GET failed, falling through to DB: ${e.message}"); return null }
-            ?: return null
-        val sep = raw.indexOf('\n')
-        if (sep < 0) return raw
-        val cachedHash = raw.substring(0, sep)
-        val cachedResponse = raw.substring(sep + 1)
-        if (cachedHash != requestHash) {
-            throw IllegalArgumentException(
-                "Idempotency key was already used with a different amount/currency"
-            )
-        }
-        return cachedResponse
-    }
-
-    private fun redisSetIdem(key: String, requestHash: String, responseJson: String) =
-        try { redisTemplate.opsForValue().set(IDEM_PREFIX + key, "$requestHash\n$responseJson", IDEM_TTL) }
-        catch (e: Exception) { log.warn("Redis SET failed for idempotency key '$key': ${e.message}") }
-
-    // ── Redis distributed lock (for confirm/capture) ────────────────────────
-
-    /**
-     * Acquires a Redis distributed lock using SET NX EX.
-     * Returns the lock value (UUID) on success, null if the lock is already held.
-     */
-    private fun acquireRedisLock(intentId: String): String? {
-        val lockValue = UUID.randomUUID().toString()
-        val acquired = try {
-            redisTemplate.opsForValue()
-                .setIfAbsent(LOCK_PREFIX + intentId, lockValue, LOCK_TTL)
-                ?: false
-        } catch (e: Exception) {
-            log.warn("Redis lock acquire failed for intent $intentId, proceeding without lock: ${e.message}")
-            return lockValue
-        }
-        return if (acquired) lockValue else null
-    }
-
-    /**
-     * Releases a Redis distributed lock only if it's still owned by this holder.
-     * Uses a Lua script for atomic check-and-delete to avoid releasing another holder's lock.
-     */
-    private fun releaseRedisLock(intentId: String, lockValue: String) {
-        try {
-            val script = "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end"
-            redisTemplate.execute(
-                org.springframework.data.redis.core.script.DefaultRedisScript(script, Long::class.java),
-                listOf(LOCK_PREFIX + intentId),
-                lockValue
-            )
-        } catch (e: Exception) {
-            log.warn("Redis lock release failed for intent $intentId: ${e.message}")
-        }
-    }
-
     // ── Create ──────────────────────────────────────────────────────────────
 
-    /**
-     * Creates a PaymentIntent with optional idempotency key.
-     *
-     * Flow:
-     * 1. Redis pre-check: if the key is cached, return immediately (zero DB cost).
-     * 2. On cache miss: insert IdempotencyKey row optimistically (unique constraint on PK).
-     *    - If insert succeeds → this is the first request, create the PaymentIntent normally.
-     *    - If DataIntegrityViolationException → a concurrent request won the race,
-     *      read the winner's response from the IdempotencyKey table and return it.
-     * 3. After commit, write the response to Redis so subsequent retries hit the cache.
-     *
-     * No advisory locks, no distributed locks — the DB unique constraint serialises the race.
-     */
     fun createPaymentIntent(
         request: CreatePaymentIntentRequest,
         idempotencyKey: String?
     ): PaymentIntentResponse {
+        val currency = request.validatedCurrency()
+
         val requestHash = if (idempotencyKey != null) {
             HashUtils.sha256(
-                "${request.amount}${request.currency.uppercase()}" +
+                "${request.amount}${currency.name}" +
                 "${request.description.orEmpty()}" +
                 "${request.customerEmail.orEmpty()}" +
                 "${request.customerId.orEmpty()}"
             )
         } else null
 
+        // Redis pre-check via circuit breaker
         if (idempotencyKey != null && requestHash != null) {
-            redisGetIdem(idempotencyKey, requestHash)?.let {
+            lockManager.redisGetIdem(idempotencyKey, requestHash)?.let {
                 log.info("Redis HIT for idempotency key '$idempotencyKey' (create)")
                 return objectMapper.readValue(it, PaymentIntentResponse::class.java)
             }
@@ -154,7 +70,7 @@ class PaymentIntentService(
 
                 val intent = PaymentIntent(
                     amount = request.amount,
-                    currency = request.currency.uppercase(),
+                    currency = currency,
                     description = request.description,
                     statementDescriptor = request.statementDescriptor?.take(22),
                     metadata = request.metadata?.let { objectMapper.writeValueAsString(it) },
@@ -189,44 +105,43 @@ class PaymentIntentService(
             objectMapper.readValue(winner.response, PaymentIntentResponse::class.java)
         }
 
+        // Cache in Redis via circuit breaker
         if (idempotencyKey != null && requestHash != null) {
-            redisSetIdem(idempotencyKey, requestHash, objectMapper.writeValueAsString(response))
+            lockManager.redisSetIdem(idempotencyKey, requestHash, objectMapper.writeValueAsString(response))
         }
         return response
     }
 
     // ── Confirm ─────────────────────────────────────────────────────────────
 
-    /**
-     * Confirms a PaymentIntent, creating a PaymentAttempt + auth InternalAttempt.
-     *
-     * Concurrency is controlled by a Redis distributed lock on the intentId:
-     * - SET NX EX ensures only one confirm is processed at a time across all app instances.
-     * - If the lock is already held, return 409 immediately (no DB connection consumed).
-     * - findByIdForUpdate remains as a DB-level safety net inside the transaction.
-     *
-     * No idempotency key needed — the lock is on the resource (intentId) itself.
-     */
     fun confirmPaymentIntent(
         intentId: String,
         request: ConfirmPaymentIntentRequest
     ): PaymentIntentResponse {
-        val lockValue = acquireRedisLock(intentId)
-            ?: throw IllegalStateException("Another confirm is already in progress for PaymentIntent $intentId")
-
-        // Tokenize card data immediately — raw PAN never reaches the DB or logs
-        val token = tokenVaultService.tokenize(
-            cardNumber = request.cardNumber,
-            cardholderName = request.cardholderName,
-            expiryMonth = request.expiryMonth,
-            expiryYear = request.expiryYear,
-            cvc = request.cvc
-        )
-        val cardBrand = tokenVaultService.resolveCardBrand(token)
-        val last4 = tokenVaultService.resolveLast4(token)
+        val lockResult = lockManager.acquireLock(intentId)
 
         try {
-            val (response, attemptToDispatch) = transactionTemplate.execute {
+            // Tokenize via PCI services — raw PAN never persisted here
+            val cardDataId = vaultClient.createCardData(
+                pan = request.cardNumber,
+                expMonth = request.expiryMonth,
+                expYear = request.expiryYear,
+                cardholderName = request.cardholderName
+            )
+
+            val brand = CardBrand.fromBin(request.cardNumber)
+            val last4 = request.cardNumber.takeLast(4)
+
+            val paymentMethodId = tokenClient.createPaymentMethod(
+                customerId = null,
+                cardDataId = cardDataId,
+                brand = brand.name.lowercase(),
+                last4 = last4,
+                expMonth = request.expiryMonth,
+                expYear = request.expiryYear
+            )
+
+            val response = transactionTemplate.execute {
                 val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                     .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
@@ -237,41 +152,38 @@ class PaymentIntentService(
                 val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 if (existingAttempt != null) {
                     log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
-                    return@execute Pair(intent.toResponse(), null)
+                    return@execute intent.toResponse()
                 }
 
                 val attempt = PaymentAttempt(
                     paymentIntentId = intentId,
-                    paymentToken = token,
-                    cardBrand = cardBrand,
+                    paymentMethodId = paymentMethodId,
+                    cardBrand = brand,
                     last4 = last4,
                     status = PaymentAttemptStatus.PENDING
                 )
                 paymentAttemptRepository.save(attempt)
 
-                val internalAttempt = InternalAttempt(
-                    paymentAttemptId = attempt.id,
-                    type = InternalAttemptType.AUTH,
-                    requestPayload = objectMapper.writeValueAsString(
-                        mapOf("paymentToken" to token, "cardBrand" to cardBrand, "amount" to intent.amount, "currency" to intent.currency)
-                    )
-                )
-                internalAttemptRepository.save(internalAttempt)
+                // Dispatch to card-auth-service (outside transaction)
+                try {
+                    authClient.confirm(intentId, paymentMethodId, attempt.id, intent.amount, intent.currency.name)
+                } catch (e: Exception) {
+                    log.warn("Auth-service dispatch failed for intent $intentId — scheduler will retry: ${e.message}")
+                }
 
-                Pair(intent.toResponse(), internalAttempt as InternalAttempt?)
+                intent.toResponse()
             }!!
 
-            dispatchBestEffort(attemptToDispatch)
             return response
         } finally {
-            releaseRedisLock(intentId, lockValue)
+            lockManager.releaseLock(intentId, lockResult)
         }
     }
 
     // ── Capture ─────────────────────────────────────────────────────────────
 
     fun capturePaymentIntent(intentId: String): PaymentIntentResponse {
-        val (response, attemptToDispatch) = transactionTemplate.execute {
+        val response = transactionTemplate.execute {
             val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                 .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
@@ -285,117 +197,63 @@ class PaymentIntentService(
             val attempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 ?: throw IllegalStateException("No PaymentAttempt found for intent $intentId")
 
-            val alreadyCapturing = internalAttemptRepository.findByPaymentAttemptId(attempt.id)
-                .any { it.type == InternalAttemptType.CAPTURE }
-            if (alreadyCapturing) {
-                log.warn("Duplicate capture blocked for intent $intentId")
-                return@execute Pair(intent.toResponse(), null)
+            try {
+                authClient.capture(attempt.id, intent.amount, intent.currency.name)
+            } catch (e: Exception) {
+                log.warn("Auth-service capture dispatch failed for intent $intentId: ${e.message}")
             }
 
-            val internalAttempt = InternalAttempt(
-                paymentAttemptId = attempt.id,
-                type = InternalAttemptType.CAPTURE,
-                requestPayload = objectMapper.writeValueAsString(
-                    mapOf("paymentAttemptId" to attempt.id, "action" to "capture")
-                )
-            )
-            internalAttemptRepository.save(internalAttempt)
-
-            Pair(intent.toResponse(), internalAttempt as InternalAttempt?)
+            intent.toResponse()
         }!!
 
-        dispatchBestEffort(attemptToDispatch)
         return response
-    }
-
-    // ── Gateway dispatch ────────────────────────────────────────────────────
-
-    private fun dispatchBestEffort(internalAttempt: InternalAttempt?) {
-        if (internalAttempt == null) return
-        try {
-            gatewayClient.dispatch(internalAttempt)
-            dispatchMarkService.markDispatched(internalAttempt.id)
-        } catch (e: Exception) {
-            log.warn("Dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
-        }
     }
 
     // ── Webhook handling ────────────────────────────────────────────────────
 
     @Transactional
     fun handleWebhook(internalAttemptId: String, gatewayStatus: String) {
-        val probe = internalAttemptRepository.findById(internalAttemptId)
-            .orElseThrow { IllegalArgumentException("InternalAttempt $internalAttemptId not found") }
-        val probedAttempt = paymentAttemptRepository.findById(probe.paymentAttemptId)
-            .orElseThrow { IllegalStateException("PaymentAttempt not found for InternalAttempt $internalAttemptId") }
+        // Forward to auth-service to process InternalAttempt
+        val result = authClient.processWebhook(internalAttemptId, gatewayStatus)
 
-        val intent = paymentIntentRepository.findByIdForUpdate(probedAttempt.paymentIntentId)
-            .orElseThrow { IllegalStateException("PaymentIntent not found") }
-
-        val internalAttempt = internalAttemptRepository.findById(internalAttemptId)
-            .orElseThrow { IllegalArgumentException("InternalAttempt $internalAttemptId not found") }
-
-        val terminalInternalStatuses = setOf(
-            InternalAttemptStatus.SUCCESS,
-            InternalAttemptStatus.FAILURE,
-            InternalAttemptStatus.EXPIRED
-        )
-        if (internalAttempt.status in terminalInternalStatuses) {
-            log.warn("Ignoring webhook for already-terminal InternalAttempt $internalAttemptId (status=${internalAttempt.status})")
+        if (!result.shouldUpdate) {
+            log.info("Webhook for $internalAttemptId — no update needed (status=${result.resolvedStatus})")
             return
         }
 
-        val resolvedStatus = when (gatewayStatus.lowercase()) {
-            "success" -> InternalAttemptStatus.SUCCESS
-            "failure" -> InternalAttemptStatus.FAILURE
-            "timeout" -> InternalAttemptStatus.TIMEOUT
-            else -> throw IllegalArgumentException("Unknown gateway status: $gatewayStatus")
-        }
+        val attempt = paymentAttemptRepository.findById(result.paymentAttemptId)
+            .orElseThrow { IllegalStateException("PaymentAttempt ${result.paymentAttemptId} not found") }
 
-        internalAttempt.status = resolvedStatus
-        internalAttempt.responsePayload = objectMapper.writeValueAsString(mapOf("status" to gatewayStatus))
-        internalAttempt.updatedAt = Instant.now()
-        internalAttemptRepository.save(internalAttempt)
+        val intent = paymentIntentRepository.findByIdForUpdate(attempt.paymentIntentId)
+            .orElseThrow { IllegalStateException("PaymentIntent not found") }
 
-        val attempt = paymentAttemptRepository.findById(internalAttempt.paymentAttemptId)
-            .orElseThrow { IllegalStateException("PaymentAttempt not found") }
-
-        when (internalAttempt.type) {
-            InternalAttemptType.AUTH -> handleAuthWebhook(attempt, intent, resolvedStatus)
-            InternalAttemptType.CAPTURE -> handleCaptureWebhook(attempt, intent, resolvedStatus)
+        when (result.type) {
+            "auth" -> handleAuthWebhook(attempt, intent, result.resolvedStatus)
+            "capture" -> handleCaptureWebhook(attempt, intent, result.resolvedStatus)
         }
     }
 
-    private fun handleAuthWebhook(
-        attempt: PaymentAttempt,
-        intent: PaymentIntent,
-        status: InternalAttemptStatus
-    ) {
+    private fun handleAuthWebhook(attempt: PaymentAttempt, intent: PaymentIntent, resolvedStatus: String) {
         val terminalIntentStatuses = setOf(
-            PaymentIntentStatus.AUTHORIZED,
-            PaymentIntentStatus.CAPTURED,
-            PaymentIntentStatus.FAILED,
-            PaymentIntentStatus.EXPIRED
+            PaymentIntentStatus.AUTHORIZED, PaymentIntentStatus.CAPTURED,
+            PaymentIntentStatus.FAILED, PaymentIntentStatus.EXPIRED
         )
         if (intent.status in terminalIntentStatuses) {
             log.warn("Ignoring auth webhook for already-terminal intent ${intent.id} (status=${intent.status})")
             return
         }
-        when (status) {
-            InternalAttemptStatus.SUCCESS -> {
+        when (resolvedStatus) {
+            "success" -> {
                 attempt.status = PaymentAttemptStatus.AUTHORIZED
                 intent.status = PaymentIntentStatus.AUTHORIZED
                 log.info("PaymentIntent ${intent.id} authorized")
             }
-            InternalAttemptStatus.FAILURE -> {
+            "failure" -> {
                 attempt.status = PaymentAttemptStatus.FAILED
                 intent.status = PaymentIntentStatus.FAILED
                 log.info("PaymentIntent ${intent.id} failed")
             }
-            else -> {
-                log.info("Auth webhook with status $status - no final state update yet (retry pending)")
-                return
-            }
+            else -> return
         }
         attempt.updatedAt = Instant.now()
         intent.updatedAt = Instant.now()
@@ -403,13 +261,9 @@ class PaymentIntentService(
         paymentIntentRepository.save(intent)
     }
 
-    private fun handleCaptureWebhook(
-        attempt: PaymentAttempt,
-        intent: PaymentIntent,
-        status: InternalAttemptStatus
-    ) {
-        when (status) {
-            InternalAttemptStatus.SUCCESS -> {
+    private fun handleCaptureWebhook(attempt: PaymentAttempt, intent: PaymentIntent, resolvedStatus: String) {
+        when (resolvedStatus) {
+            "success" -> {
                 attempt.status = PaymentAttemptStatus.CAPTURED
                 intent.status = PaymentIntentStatus.CAPTURED
                 attempt.updatedAt = Instant.now()
@@ -418,12 +272,8 @@ class PaymentIntentService(
                 paymentIntentRepository.save(intent)
                 log.info("PaymentIntent ${intent.id} captured")
             }
-            InternalAttemptStatus.FAILURE -> {
-                log.warn("Capture failed for PaymentIntent ${intent.id} — still authorized, retry is possible")
-            }
-            else -> {
-                log.info("Capture webhook with status $status for ${intent.id} — retry pending")
-            }
+            "failure" -> log.warn("Capture failed for PaymentIntent ${intent.id} — still authorized, retry is possible")
+            else -> log.info("Capture webhook with status $resolvedStatus for ${intent.id} — retry pending")
         }
     }
 
@@ -435,21 +285,30 @@ class PaymentIntentService(
 
         val attempts = paymentAttemptRepository.findByPaymentIntentId(intentId)
         val attemptIds = attempts.map { it.id }
-        val allInternalAttempts = if (attemptIds.isNotEmpty()) {
-            internalAttemptRepository.findByPaymentAttemptIdIn(attemptIds).groupBy { it.paymentAttemptId }
-        } else emptyMap()
+
+        // Fetch InternalAttempts from auth-service
+        val allInternalAttempts = authClient.getAttemptsBatch(attemptIds)
 
         val attemptDetails = attempts.map { attempt ->
+            val internalAttempts = allInternalAttempts[attempt.id] ?: emptyList()
             PaymentAttemptDetailResponse(
                 id = attempt.id,
                 paymentIntentId = attempt.paymentIntentId,
-                paymentToken = attempt.paymentToken,
-                cardBrand = attempt.cardBrand,
+                paymentMethodId = attempt.paymentMethodId,
+                cardBrand = attempt.cardBrand?.name?.lowercase(),
                 last4 = attempt.last4,
                 status = attempt.status.name.lowercase(),
                 createdAt = attempt.createdAt,
                 updatedAt = attempt.updatedAt,
-                internalAttempts = (allInternalAttempts[attempt.id] ?: emptyList()).map { it.toResponse() }
+                internalAttempts = internalAttempts.map { ia ->
+                    com.payment.gateway.dto.InternalAttemptResponse(
+                        id = ia.id, paymentAttemptId = ia.paymentAttemptId,
+                        provider = ia.provider, status = ia.status,
+                        type = ia.type, retryCount = ia.retryCount,
+                        requestPayload = ia.requestPayload, responsePayload = ia.responsePayload,
+                        createdAt = ia.createdAt, updatedAt = ia.updatedAt
+                    )
+                }
             )
         }
 

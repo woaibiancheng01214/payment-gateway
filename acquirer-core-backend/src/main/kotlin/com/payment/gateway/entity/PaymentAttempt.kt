@@ -9,7 +9,6 @@ enum class PaymentAttemptStatus {
     AUTHORIZED,
     CAPTURED,
     FAILED,
-    /** No gateway response arrived within the configured timeout window. */
     EXPIRED
 }
 
@@ -21,7 +20,7 @@ enum class PaymentAttemptStatus {
         Index(name = "idx_pa_intent_id_created", columnList = "paymentIntentId, createdAt")
     ]
 )
-data class PaymentAttempt(
+class PaymentAttempt(
     @Id
     val id: String = UUID.randomUUID().toString(),
 
@@ -29,9 +28,10 @@ data class PaymentAttempt(
     val paymentIntentId: String,
 
     @Column(name = "payment_method", nullable = false)
-    val paymentToken: String,
+    val paymentMethodId: String,
 
-    val cardBrand: String? = null,
+    @Enumerated(EnumType.STRING)
+    val cardBrand: CardBrand? = null,
 
     val last4: String? = null,
 
@@ -44,4 +44,14 @@ data class PaymentAttempt(
 
     @Column(nullable = false)
     var updatedAt: Instant = Instant.now()
-)
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is PaymentAttempt) return false
+        return id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
+
+    override fun toString(): String = "PaymentAttempt(id=$id, status=$status, paymentIntentId=$paymentIntentId)"
+}

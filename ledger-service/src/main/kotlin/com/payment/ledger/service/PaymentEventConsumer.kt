@@ -4,6 +4,8 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.payment.ledger.entity.DeadLetterEvent
+import com.payment.ledger.repository.DeadLetterEventRepository
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.stereotype.Service
@@ -14,7 +16,9 @@ data class PaymentIntentSnapshot(
     val id: String,
     val amount: Long,
     val currency: String,
-    val status: String
+    val status: String,
+    @JsonProperty("created_at") val createdAt: String? = null,
+    @JsonProperty("updated_at") val updatedAt: String? = null
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -34,6 +38,7 @@ data class DebeziumMessage(
 @Service
 class PaymentEventConsumer(
     private val ledgerService: LedgerService,
+    private val deadLetterEventRepository: DeadLetterEventRepository,
     private val objectMapper: ObjectMapper
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
@@ -47,7 +52,14 @@ class PaymentEventConsumer(
 
             val after = envelope.after ?: return
             val oldStatus = envelope.before?.status
-            val eventTimestamp = Instant.ofEpochMilli(envelope.tsMs ?: System.currentTimeMillis())
+
+            // Use updatedAt from PaymentIntent as the authoritative event timestamp
+            // This ensures correct ordering even for manually replayed events
+            val eventTimestamp = when {
+                after.updatedAt != null -> parseTimestamp(after.updatedAt)
+                envelope.tsMs != null -> Instant.ofEpochMilli(envelope.tsMs)
+                else -> Instant.now()
+            }
 
             if (oldStatus == after.status) return
 
@@ -55,8 +67,38 @@ class PaymentEventConsumer(
             processTransition(after.id, oldStatus, after.status, after.amount, after.currency, eventTimestamp)
         } catch (e: Exception) {
             log.error("Failed to process CDC event: ${e.message}", e)
+            // Persist to dead letter table for manual review/retry
+            try {
+                deadLetterEventRepository.save(
+                    DeadLetterEvent(
+                        topic = "payment_intents_cdc",
+                        payload = message,
+                        errorMessage = "${e.javaClass.simpleName}: ${e.message}"
+                    )
+                )
+                log.info("Saved failed CDC event to dead_letter_events table")
+            } catch (dlErr: Exception) {
+                log.error("Failed to save dead letter event: ${dlErr.message}", dlErr)
+            }
         }
     }
+
+    /**
+     * Parses timestamp from Debezium CDC. Depending on the Debezium converter config,
+     * timestamps may arrive as ISO strings ("2026-03-29T07:48:14.927098Z") or
+     * epoch microseconds. Handles both formats.
+     */
+    private fun parseTimestamp(value: String): Instant =
+        try {
+            Instant.parse(value)
+        } catch (e: Exception) {
+            try {
+                val micros = value.toLong()
+                Instant.ofEpochSecond(micros / 1_000_000, (micros % 1_000_000) * 1_000)
+            } catch (e2: Exception) {
+                Instant.now()
+            }
+        }
 
     private fun parseEnvelope(message: String): DebeziumEnvelope? {
         val wrapped = objectMapper.readValue<DebeziumMessage>(message)
