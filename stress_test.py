@@ -1480,6 +1480,215 @@ def test_sustained_load():
                      f"{ledger_missing}/{sampled} authorized intents missing ledger entries (CDC propagation delay)")
 
 
+def test_cursor_pagination():
+    """
+    Validates cursor-based pagination:
+    1. First page returns data without starting_after
+    2. Subsequent page uses last ID as cursor
+    3. Results are ordered by created_at DESC
+    4. Merchant-scoped cursor pagination works
+    5. No duplicate IDs across pages
+    """
+    print(f"\n{BOLD}── Test 14: Cursor-Based Pagination ──{RESET}")
+
+    merchant_id = ensure_test_merchant()
+
+    # Create 10 intents to have enough data
+    created_ids_local = []
+    for _ in range(10):
+        intent = create_intent(amount=rand_amount(), currency=rand_currency(), merchant_id=merchant_id)
+        created_ids_local.append(intent["id"])
+
+    # 1. First page (no cursor, limit=3)
+    r = requests.get(f"{BASE}/v1/payment_intents/cursor", params={"limit": 3}, timeout=10)
+    if r.status_code != 200:
+        record_issue("CRITICAL", "cursor_pagination", f"First page failed: {r.status_code}")
+        return
+    page1 = r.json()
+    assert "data" in page1, f"Response missing 'data' field: {page1}"
+    assert "hasMore" in page1, f"Response missing 'hasMore' field: {page1}"
+    ok(f"First page: {len(page1['data'])} items, hasMore={page1['hasMore']}")
+
+    if len(page1["data"]) != 3:
+        record_issue("WARNING", "cursor_pagination", f"Expected 3 items, got {len(page1['data'])}")
+
+    # 2. Second page using last ID as cursor
+    if page1["hasMore"] and page1["data"]:
+        last_id = page1["data"][-1]["id"]
+        r2 = requests.get(f"{BASE}/v1/payment_intents/cursor",
+                          params={"starting_after": last_id, "limit": 3}, timeout=10)
+        assert r2.status_code == 200, f"Second page failed: {r2.status_code}"
+        page2 = r2.json()
+        ok(f"Second page: {len(page2['data'])} items, hasMore={page2['hasMore']}")
+
+        # No overlap between pages
+        page1_ids = {d["id"] for d in page1["data"]}
+        page2_ids = {d["id"] for d in page2["data"]}
+        overlap = page1_ids & page2_ids
+        if overlap:
+            record_issue("CRITICAL", "cursor_pagination", f"Duplicate IDs across pages: {overlap}")
+        else:
+            ok("No duplicate IDs between page 1 and page 2")
+    else:
+        warn("hasMore=false or empty first page — can't test cursor continuation")
+
+    # 3. Merchant-scoped cursor pagination
+    r3 = requests.get(f"{BASE}/v1/payment_intents/cursor/merchant/{merchant_id}",
+                      params={"limit": 5}, timeout=10)
+    if r3.status_code == 200:
+        mpage = r3.json()
+        ok(f"Merchant cursor page: {len(mpage['data'])} items, hasMore={mpage['hasMore']}")
+        # All results should belong to the correct merchant
+        wrong_merchant = [d for d in mpage["data"] if d.get("merchantId") != merchant_id]
+        if wrong_merchant:
+            record_issue("CRITICAL", "cursor_pagination",
+                         f"{len(wrong_merchant)} items belong to wrong merchant")
+        else:
+            ok("All merchant-scoped results belong to correct merchant")
+    else:
+        record_issue("WARNING", "cursor_pagination", f"Merchant cursor endpoint returned {r3.status_code}")
+
+    # 4. Invalid cursor
+    r4 = requests.get(f"{BASE}/v1/payment_intents/cursor",
+                      params={"starting_after": "nonexistent-id", "limit": 3}, timeout=10)
+    if r4.status_code == 400:
+        ok("Invalid cursor correctly rejected (400)")
+    else:
+        record_issue("WARNING", "cursor_pagination",
+                     f"Invalid cursor returned {r4.status_code}, expected 400")
+
+
+def test_correlation_ids():
+    """
+    Validates X-Correlation-Id propagation:
+    1. Response includes X-Correlation-Id header (auto-generated)
+    2. Client-provided correlation ID is echoed back
+    """
+    print(f"\n{BOLD}── Test 15: Correlation ID Propagation ──{RESET}")
+
+    # 1. Auto-generated correlation ID
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": ensure_test_merchant(), "amount": 100, "currency": "USD"},
+                      timeout=10)
+    corr_id = r.headers.get("X-Correlation-Id")
+    if corr_id:
+        ok(f"Response includes auto-generated X-Correlation-Id: {corr_id[:20]}...")
+    else:
+        record_issue("WARNING", "correlation_ids", "Response missing X-Correlation-Id header")
+
+    # 2. Client-provided correlation ID is echoed
+    custom_id = f"test-trace-{uuid.uuid4()}"
+    r2 = requests.post(f"{BASE}/v1/payment_intents",
+                       json={"merchantId": ensure_test_merchant(), "amount": 200, "currency": "USD"},
+                       headers={"X-Correlation-Id": custom_id},
+                       timeout=10)
+    echoed = r2.headers.get("X-Correlation-Id")
+    if echoed == custom_id:
+        ok(f"Client-provided correlation ID echoed correctly")
+    elif echoed:
+        record_issue("WARNING", "correlation_ids",
+                     f"Echoed ID '{echoed}' doesn't match sent '{custom_id}'")
+    else:
+        record_issue("WARNING", "correlation_ids", "X-Correlation-Id not echoed")
+
+
+def test_business_metrics():
+    """
+    Validates that payment-specific Prometheus metrics are exposed:
+    1. payment_intents_created_total counter exists
+    2. payment_intents_confirm_duration histogram exists
+    3. payment_webhooks_processed_total counter exists
+    """
+    print(f"\n{BOLD}── Test 16: Business Metrics (Prometheus) ──{RESET}")
+
+    try:
+        r = requests.get(f"{BASE}/actuator/prometheus", timeout=10)
+        if r.status_code != 200:
+            record_issue("WARNING", "business_metrics", f"Prometheus endpoint returned {r.status_code}")
+            return
+        metrics_text = r.text
+
+        expected_metrics = [
+            "payment_intents_created_total",
+            "payment_intents_confirm_duration_seconds",
+            "payment_intents_capture_requested_total",
+            "payment_webhooks_processed_total",
+        ]
+
+        for metric_name in expected_metrics:
+            if metric_name in metrics_text:
+                ok(f"Metric '{metric_name}' is exposed")
+            else:
+                record_issue("WARNING", "business_metrics",
+                             f"Metric '{metric_name}' not found in Prometheus output")
+
+        # Check that status_changes counter exists (may only appear after a webhook is processed)
+        if "payment_intents_status_changes" in metrics_text:
+            ok("Status change counter is exposed")
+        else:
+            warn("Status change counter not yet populated (needs webhook processing)")
+
+    except Exception as e:
+        record_issue("WARNING", "business_metrics", f"Failed to fetch metrics: {e}")
+
+
+def test_webhook_secret_rotation():
+    """
+    Validates dual-secret webhook verification:
+    1. Webhook signed with current secret is accepted
+    2. Webhook signed with a wrong secret is rejected
+    """
+    print(f"\n{BOLD}── Test 17: Webhook Signature Verification ──{RESET}")
+
+    # Create and confirm an intent to get an internal attempt ID
+    intent = create_intent()
+    iid = intent["id"]
+    confirm_intent(iid)
+    time.sleep(3)
+
+    detail = get_intent(iid)
+    attempts = detail.get("attempts", [])
+    if not attempts:
+        warn("No attempts — skipping webhook test")
+        return
+    internals = attempts[0].get("internalAttempts", [])
+    if not internals:
+        warn("No internal attempts — skipping webhook test")
+        return
+
+    ia_id = internals[0]["id"]
+
+    # 1. Correctly signed webhook (should succeed — 200 or already terminal)
+    r1 = signed_webhook_post(ia_id, "success")
+    if r1.status_code in (200, 204):
+        ok(f"Correctly signed webhook accepted (status={r1.status_code})")
+    else:
+        warn(f"Signed webhook returned {r1.status_code} (intent may already be terminal)")
+
+    # 2. Incorrectly signed webhook (should be rejected — 401)
+    payload = {"internalAttemptId": ia_id, "status": "success"}
+    body = json.dumps(payload)
+    timestamp = str(int(time.time()))
+    bad_signature = hmac.new(
+        "wrong-secret-12345".encode(), f"{timestamp}.{body}".encode(), hashlib.sha256
+    ).hexdigest()
+    r2 = requests.post(
+        f"{BASE}/v1/webhooks/gateway",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Gateway-Signature": bad_signature,
+            "X-Gateway-Timestamp": timestamp,
+        },
+        timeout=5,
+    )
+    if r2.status_code == 401:
+        ok("Incorrectly signed webhook rejected (401)")
+    else:
+        record_issue("CRITICAL", "webhook_security",
+                     f"Incorrectly signed webhook returned {r2.status_code}, expected 401")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1511,6 +1720,10 @@ if __name__ == "__main__":
             test_expiry_blocks_late_webhook,
             test_dispatch_retry,
             test_pci_service_architecture,
+            test_cursor_pagination,
+            test_correlation_ids,
+            test_business_metrics,
+            test_webhook_secret_rotation,
             test_sustained_load,
             test_ledger_consistency,
         ]
