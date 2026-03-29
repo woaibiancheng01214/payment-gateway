@@ -1,5 +1,6 @@
 package com.payment.gateway.service
 
+import com.github.benmanes.caffeine.cache.Caffeine
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import org.slf4j.LoggerFactory
@@ -23,18 +24,28 @@ class MerchantClient(
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "merchantServiceCircuitBreaker",
         CircuitBreakerConfig.custom()
-            .slidingWindowSize(10)
+            .slidingWindowSize(20)
             .failureRateThreshold(50f)
+            .slowCallRateThreshold(80f)
+            .slowCallDurationThreshold(Duration.ofSeconds(2))
             .waitDurationInOpenState(Duration.ofSeconds(15))
             .permittedNumberOfCallsInHalfOpenState(3)
-            .minimumNumberOfCalls(5)
+            .minimumNumberOfCalls(10)
             .build()
     )
+
+    private val merchantCache = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(Duration.ofMinutes(5))
+        .build<String, Boolean>()
 
     data class MerchantExistsResponse(val exists: Boolean)
 
     fun merchantExists(merchantId: String): Boolean {
-        return try {
+        val cached = merchantCache.getIfPresent(merchantId)
+        if (cached != null) return cached
+
+        val result = try {
             CircuitBreaker.decorateSupplier(circuitBreaker) {
                 val response = http.getForEntity(
                     "$merchantServiceUrl/internal/merchants/$merchantId/exists",
@@ -46,5 +57,8 @@ class MerchantClient(
             log.error("Failed to check merchant existence for $merchantId: ${e.message}")
             throw IllegalStateException("Merchant service unavailable")
         }
+
+        merchantCache.put(merchantId, result)
+        return result
     }
 }

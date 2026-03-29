@@ -30,11 +30,13 @@ class GatewayClient(
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "gatewayCircuitBreaker",
         CircuitBreakerConfig.custom()
-            .slidingWindowSize(10)
+            .slidingWindowSize(20)
             .failureRateThreshold(50f)
+            .slowCallRateThreshold(80f)
+            .slowCallDurationThreshold(Duration.ofSeconds(2))
             .waitDurationInOpenState(Duration.ofSeconds(30))
             .permittedNumberOfCallsInHalfOpenState(3)
-            .minimumNumberOfCalls(5)
+            .minimumNumberOfCalls(10)
             .build()
     )
 

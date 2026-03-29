@@ -1111,3 +1111,246 @@ instance crashes mid-sweep.
 
 **Takeaway:** `@Scheduled` without `@SchedulerLock` is a bug in any multi-instance
 deployment. Treat them as an inseparable pair.
+
+---
+
+## 39. PostgreSQL defaults are insufficient for microservice connection pools
+
+Running 6 databases on one PostgreSQL instance with default `max_connections=100` and
+`shared_buffers=128MB` hits two walls at scale:
+
+1. **Connection limit:** HikariCP pools across 6 services sum to 80+30+20+20+15+10=175
+   minimum connections. Default `max_connections=100` means services fail to connect under
+   load, with `FATAL: too many connections for role "postgres"`.
+
+2. **Buffer cache thrashing:** 128MB shared_buffers across 6 databases means each database
+   gets ~21MB of cache. The `idx_pi_status_updated` index alone exceeds this at scale,
+   causing constant disk I/O for scheduler sweep queries.
+
+**Fix:** Explicit tuning in docker-compose command:
+```
+shared_buffers=256MB      # 25% of container RAM
+max_connections=200       # headroom above pool sum
+work_mem=4MB              # per-sort memory
+checkpoint_completion_target=0.9  # spread checkpoint I/O
+effective_cache_size=768MB  # tell planner about OS cache
+```
+
+Also increased container memory from 1GB to 2GB — `shared_buffers=256MB` plus 6 databases
+of working state plus WAL buffers easily exceeds 1GB.
+
+**Takeaway:** Size PostgreSQL for the sum of all client pools, not for one service.
+`max_connections` should be 20-30% above the total pool size to handle transient spikes
+and monitoring connections.
+
+---
+
+## 40. HikariCP defaults (10 max) silently bottleneck PCI services
+
+All four new services (`card-vault-service`, `token-service`, `card-auth-service`,
+`merchant-service`) were deployed with Spring Boot's default HikariCP configuration:
+`maximum-pool-size=10`. The acquirer-core-backend was tuned to 80 connections (Learning 33),
+but the downstream services were forgotten.
+
+At 100 TPS, each confirm triggers sequential calls to vault → token → auth. Each of these
+services receives ~100 req/s. With 10 connections and ~10-50ms per DB operation, the pool
+can theoretically handle ~200-1000 req/s — but add pessimistic locks, scheduler queries,
+and connection acquisition overhead, and the effective capacity drops to ~100 req/s.
+
+At 300 TPS peak, these services become the bottleneck, causing `ConnectionTimeoutException`
+that cascades through circuit breakers back to the client.
+
+**Fix:** Sized each pool proportionally to expected load:
+- card-auth-service: 30 max / 10 min-idle (handles auth dispatch + scheduler sweeps)
+- card-vault-service: 20 max / 5 min-idle
+- token-service: 20 max / 5 min-idle
+- merchant-service: 15 max / 5 min-idle
+
+**Takeaway:** When adding new services, always configure HikariCP explicitly. The default
+of 10 is designed for low-traffic apps, not services receiving forwarded load from a
+gateway processing 100+ TPS.
+
+---
+
+## 41. RestTemplate creates a new TCP connection per request by default
+
+Spring's `RestTemplate` with the default `SimpleClientHttpRequestFactory` opens a new TCP
+connection for every HTTP request and closes it after the response. At 100 TPS with 6
+inter-service hops per confirm, that is 600 TCP connections/second being created and
+destroyed. At 300 TPS peak: 1800/second.
+
+Each TCP connection costs ~1-3ms for the handshake (even on localhost), contributes to
+ephemeral port exhaustion (`TIME_WAIT` socket buildup), and bypasses kernel-level
+connection reuse.
+
+**Fix:** Added Apache HttpClient 5 with `PoolingHttpClientConnectionManager` as a
+`@Bean`-configured `RestTemplateBuilder`:
+
+```kotlin
+val connectionManager = PoolingHttpClientConnectionManager().apply {
+    maxTotal = 100
+    defaultMaxPerRoute = 50
+}
+```
+
+This reuses TCP connections across requests, eliminating handshake overhead. The same
+`RestTemplateBuilder` bean also attaches a `ClientHttpRequestInterceptor` that forwards
+correlation IDs (see Learning 44).
+
+**Takeaway:** Any service making >10 HTTP calls/second to another service needs connection
+pooling. Spring Boot does not configure this by default — you must add the HttpClient
+dependency and wire up a `PoolingHttpClientConnectionManager`.
+
+---
+
+## 42. Caffeine local cache eliminates redundant inter-service lookups
+
+Every `createPaymentIntent` and `listPaymentIntentsByMerchant` called
+`merchantClient.merchantExists()` — a synchronous HTTP call to merchant-service. Merchant
+data changes at CRUD frequency (maybe 1/hour), but existence checks happen at transaction
+frequency (100/second).
+
+**Fix:** Wrapped the merchant existence check in a Caffeine cache with 5-minute TTL and
+10K max entries. Cache hits avoid the HTTP round-trip entirely (~0ms vs ~5-50ms).
+
+```kotlin
+private val merchantCache = Caffeine.newBuilder()
+    .maximumSize(10_000)
+    .expireAfterWrite(Duration.ofMinutes(5))
+    .build<String, Boolean>()
+```
+
+At 100 TPS, this eliminates ~100 HTTP calls/second to merchant-service (cache hit ratio
+approaches 100% after the first call for each merchant). At 500 QPS reads, it eliminates
+~500 calls/second for list endpoints.
+
+**Takeaway:** Cache near-static reference data aggressively. If the data changes at CRUD
+frequency but is read at transaction frequency, even a 1-minute cache provides a
+100x+ reduction in downstream calls.
+
+---
+
+## 43. Circuit breakers need slow-call detection, not just failure detection
+
+All circuit breakers were configured with `failureRateThreshold(50%)` but no slow-call
+threshold. A degraded downstream service responding at 4999ms (just under the 5s read
+timeout) would never trip the circuit breaker — every call "succeeds" — but would consume
+threads and connections, eventually exhausting the pool.
+
+This is worse than a failed service because the circuit breaker stays CLOSED, the system
+doesn't shed load, and all Tomcat threads pile up waiting for slow responses.
+
+**Fix:** Added slow-call detection to all circuit breakers:
+```kotlin
+.slowCallRateThreshold(80f)
+.slowCallDurationThreshold(Duration.ofSeconds(2))
+.slidingWindowSize(20)
+.minimumNumberOfCalls(10)
+```
+
+If 80% of calls in the window take >2 seconds, the circuit opens and subsequent calls
+fail immediately, freeing threads and connections. The half-open state then tests whether
+the downstream service has recovered.
+
+**Takeaway:** A circuit breaker without slow-call detection is half a circuit breaker.
+Degraded performance is a more common failure mode than complete outage, and it's more
+dangerous because it's invisible to failure-only metrics.
+
+---
+
+## 44. Correlation IDs are the foundation of distributed observability
+
+With 6 synchronous HTTP hops per confirm (checkout → vault → token → auth → vault → token
+→ gateway), a single payment traverses multiple log streams. Without a shared identifier,
+correlating a failed payment across services requires manually matching timestamps — which
+is unreliable at >10 TPS because multiple requests overlap.
+
+**Fix:** Added `CorrelationIdFilter` (a `OncePerRequestFilter`) to all 7 services:
+1. Extracts `X-Correlation-Id` from the incoming request (or generates a UUID)
+2. Stores it in SLF4J MDC as `correlationId`
+3. Echoes it in the response header
+4. Cleans up MDC after the request completes
+
+The `HttpClientConfig` bean attaches a `ClientHttpRequestInterceptor` to all RestTemplate
+instances that reads the correlation ID from MDC and adds it as a header on outbound calls.
+
+Since all services use logstash-logback-encoder for JSON logging, the MDC field is
+automatically included in every log line. Searching Kibana/Loki for
+`correlationId: "abc-123"` returns the complete distributed trace across all services.
+
+**Takeaway:** Add correlation IDs before you need them. Once you're debugging a production
+issue at 100+ TPS, it's too late to wish you had them. The implementation is ~30 lines of
+code per service and one interceptor.
+
+---
+
+## 45. Pessimistic lock timeout prevents connection pool exhaustion under contention
+
+`findByIdForUpdate()` uses `@Lock(PESSIMISTIC_WRITE)` to serialize mutations on a
+`PaymentIntent`. Without a timeout, a thread waiting for the lock holds a HikariCP
+connection indefinitely. Under contention (webhook + capture racing on the same intent),
+multiple threads can wait simultaneously, each consuming a connection.
+
+With 80 connections and 300 TPS peak, a hot PaymentIntent receiving concurrent webhook +
+capture + scheduler sweep can deadlock the entire pool in seconds if waits are unbounded.
+
+**Fix:** Added `@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))` — 3-second maximum wait. If the lock isn't acquired in 3 seconds,
+`LockTimeoutException` is thrown and caught by `GlobalExceptionHandler`, returning
+HTTP 409 Conflict with a retry hint.
+
+**Takeaway:** Every pessimistic lock needs a timeout. Unbounded lock waits turn connection
+pools into deadlock vectors under contention. The timeout should be short enough to fail
+fast but long enough to survive normal lock hold times (typically <100ms for a simple
+update).
+
+---
+
+## 46. Idempotency keys must have a TTL — unbounded growth is a silent time bomb
+
+The `idempotency_keys` table stored a row for every `create` call with an idempotency key,
+with no expiry or cleanup. The Redis layer had a 24-hour TTL, but the database (the source
+of truth) grew indefinitely.
+
+At 100 TPS with 50% of creates using idempotency keys, that's 4.3M rows/day. After 30 days:
+129M rows. The `findById()` lookup in `createPaymentIntent()` (line 66) scans the primary
+key index — which works fine at 1M rows but degrades at 100M+. The unique constraint check
+on insert also slows down as the index grows.
+
+**Fix:**
+1. Flyway migration adding `expires_at` column (default `created_at + 48h`) with index
+2. ShedLock-protected hourly scheduler deleting expired rows
+3. Entity updated with `expiresAt` field
+
+The 48-hour TTL matches Stripe's idempotency key expiry. After 48 hours, the same key can
+be reused for a different request — this is by design, since idempotency keys protect
+against retries, not against intentional new requests days later.
+
+**Takeaway:** Every append-only table needs a lifecycle. If it doesn't have a natural
+deletion trigger, add a time-based cleanup. The table that "never needs cleanup" is the
+one that fills the disk at 3am.
+
+---
+
+## 47. Encryption keys must not live in source code or environment variables
+
+The AES-256-GCM encryption key for the card vault was stored in two places:
+1. `application.properties`: `vault.encryption.key=0123456789abcdef...`
+2. `docker-compose.yml`: `VAULT_ENCRYPTION_KEY: 0123456789abcdef...`
+
+Both are committed to the repository. Anyone with repo access can decrypt all stored PANs.
+Docker `inspect` on the running container also reveals the environment variable.
+
+The Docker secrets infrastructure (`infra/secrets/vault_encryption_key.txt`) already existed
+but wasn't consumed — services used the environment variable instead.
+
+**Fix:**
+1. `EncryptionService` updated to support `vault.encryption.key-file` property (Docker
+   secrets path). File-based key takes priority over inline property.
+2. Docker-compose updated: `VAULT_ENCRYPTION_KEY_FILE: /run/secrets/vault_encryption_key`
+   with `secrets: [vault_encryption_key]`.
+3. Inline key kept in `application.properties` as local dev fallback only.
+
+**Takeaway:** Secrets in environment variables are visible to `ps`, `docker inspect`,
+and crash dumps. File-based secrets (Docker secrets, Kubernetes secrets, Vault) are the
+minimum acceptable pattern. The inline dev fallback is acceptable for local development
+but must never be the production mechanism.

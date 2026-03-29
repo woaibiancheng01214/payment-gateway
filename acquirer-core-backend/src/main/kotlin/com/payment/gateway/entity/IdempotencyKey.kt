@@ -16,7 +16,10 @@ class IdempotencyKey(
     var response: String,
 
     @Column(nullable = false)
-    val createdAt: Instant = Instant.now()
+    val createdAt: Instant = Instant.now(),
+
+    @Column(nullable = false)
+    val expiresAt: Instant = Instant.now().plusSeconds(48 * 3600)
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true

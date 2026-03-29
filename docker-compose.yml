@@ -14,13 +14,21 @@ services:
         -c wal_level=logical
         -c max_wal_senders=4
         -c max_replication_slots=4
+        -c shared_buffers=256MB
+        -c max_connections=200
+        -c work_mem=4MB
+        -c maintenance_work_mem=64MB
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=16MB
+        -c effective_cache_size=768MB
+        -c random_page_cost=1.1
     deploy:
       resources:
         limits:
           cpus: '1.0'
-          memory: 1gb
+          memory: 2gb
         reservations:
-          memory: 256mb
+          memory: 512mb
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -98,8 +106,10 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/card_vault
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
-      VAULT_ENCRYPTION_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      VAULT_ENCRYPTION_KEY_FILE: /run/secrets/vault_encryption_key
       SPRING_PROFILES_ACTIVE: docker
+    secrets:
+      - vault_encryption_key
     deploy:
       resources:
         limits:

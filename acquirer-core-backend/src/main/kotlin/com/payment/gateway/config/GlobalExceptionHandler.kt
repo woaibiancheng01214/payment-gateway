@@ -1,6 +1,7 @@
 package com.payment.gateway.config
 
 import com.payment.gateway.dto.ApiError
+import jakarta.persistence.LockTimeoutException
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
@@ -32,6 +33,18 @@ class GlobalExceptionHandler {
                 message = e.message ?: "Conflict"
             )
         )
+
+    @ExceptionHandler(LockTimeoutException::class)
+    fun handleLockTimeout(e: LockTimeoutException): ResponseEntity<ApiError> {
+        log.warn("Lock acquisition timeout: ${e.message}")
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(
+            ApiError(
+                type = ApiError.TYPE_CONFLICT,
+                code = ApiError.CODE_STATE_CONFLICT,
+                message = "Resource is currently being modified — please retry"
+            )
+        )
+    }
 
     @ExceptionHandler(MethodArgumentNotValidException::class)
     fun handleValidation(e: MethodArgumentNotValidException): ResponseEntity<ApiError> {

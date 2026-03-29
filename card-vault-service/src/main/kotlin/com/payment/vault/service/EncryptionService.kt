@@ -1,7 +1,10 @@
 package com.payment.vault.service
 
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
+import java.nio.file.Files
+import java.nio.file.Paths
 import java.security.SecureRandom
 import java.util.Base64
 import javax.crypto.Cipher
@@ -10,8 +13,11 @@ import javax.crypto.spec.SecretKeySpec
 
 @Service
 class EncryptionService(
-    @Value("\${vault.encryption.key}") private val encryptionKey: String
+    @Value("\${vault.encryption.key:}") private val encryptionKey: String,
+    @Value("\${vault.encryption.key-file:}") private val encryptionKeyFile: String
 ) {
+    private val log = LoggerFactory.getLogger(javaClass)
+
     companion object {
         private const val ALGORITHM = "AES/GCM/NoPadding"
         private const val IV_LENGTH = 12
@@ -19,8 +25,24 @@ class EncryptionService(
     }
 
     private val secretKey: SecretKeySpec by lazy {
-        val keyBytes = hexToBytes(encryptionKey)
+        val keyHex = resolveKey()
+        val keyBytes = hexToBytes(keyHex)
         SecretKeySpec(keyBytes, "AES")
+    }
+
+    private fun resolveKey(): String {
+        // Prefer file-based key (Docker secrets) over inline property
+        if (encryptionKeyFile.isNotBlank()) {
+            val path = Paths.get(encryptionKeyFile)
+            if (Files.exists(path)) {
+                log.info("Loading encryption key from file: $encryptionKeyFile")
+                return Files.readString(path).trim()
+            }
+        }
+        if (encryptionKey.isNotBlank()) {
+            return encryptionKey
+        }
+        throw IllegalStateException("No encryption key configured — set vault.encryption.key or vault.encryption.key-file")
     }
 
     fun encrypt(plaintext: String): String {
