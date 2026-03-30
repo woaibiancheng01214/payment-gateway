@@ -9,7 +9,6 @@ import org.springframework.http.HttpEntity
 import org.springframework.http.HttpMethod
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestTemplate
-import java.time.Duration
 import java.time.Instant
 
 @Service
@@ -19,10 +18,7 @@ class AuthClient(
     @Value("\${auth.service.url:http://localhost:8085}") private val authServiceUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val http: RestTemplate = restTemplateBuilder
-        .setConnectTimeout(Duration.ofSeconds(5))
-        .setReadTimeout(Duration.ofSeconds(15))
-        .build()
+    private val http: RestTemplate = restTemplateBuilder.build()
 
     data class ConfirmRequest(val paymentIntentId: String, val paymentMethodId: String, val paymentAttemptId: String, val amount: Long, val currency: String)
     data class ConfirmResponse(val internalAttemptId: String)

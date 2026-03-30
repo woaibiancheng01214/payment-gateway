@@ -22,10 +22,7 @@ class GatewayClient(
     @Value("\${gateway.callback.url:http://localhost:8080/v1/webhooks/gateway}") private val callbackUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val http: RestTemplate = restTemplateBuilder
-        .setConnectTimeout(Duration.ofSeconds(6))
-        .setReadTimeout(Duration.ofSeconds(10))
-        .build()
+    private val http: RestTemplate = restTemplateBuilder.build()
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "gatewayCircuitBreaker",

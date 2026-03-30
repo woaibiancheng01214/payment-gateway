@@ -36,7 +36,7 @@ def test_webhook_replay():
     info(f"Terminal status: {original_status}")
 
     # Find an InternalAttempt ID from the detail response
-    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}/detail", timeout=10)
+    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}", timeout=10)
     detail_resp.raise_for_status()
     detail_data = detail_resp.json()
 
@@ -83,7 +83,7 @@ def test_late_webhook_after_terminal():
 
     time.sleep(3)
 
-    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}/detail", timeout=10)
+    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}", timeout=10)
     detail_resp.raise_for_status()
     detail_data = detail_resp.json()
     current_status = detail_data["status"]
@@ -159,7 +159,7 @@ def test_pci_tokenization_flow():
     # Wait briefly for processing
     time.sleep(2)
 
-    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}/detail", timeout=10)
+    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}", timeout=10)
     detail_resp.raise_for_status()
     detail_data = detail_resp.json()
 

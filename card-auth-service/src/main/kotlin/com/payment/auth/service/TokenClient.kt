@@ -15,10 +15,7 @@ class TokenClient(
     @Value("\${token.service.url:http://localhost:8084}") private val tokenServiceUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val http: RestTemplate = restTemplateBuilder
-        .setConnectTimeout(Duration.ofSeconds(5))
-        .setReadTimeout(Duration.ofSeconds(5))
-        .build()
+    private val http: RestTemplate = restTemplateBuilder.build()
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "pciTokenCircuitBreaker",

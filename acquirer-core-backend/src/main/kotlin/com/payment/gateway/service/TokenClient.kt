@@ -5,7 +5,6 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.web.client.RestTemplateBuilder
 import org.springframework.stereotype.Service
 import org.springframework.web.client.RestTemplate
-import java.time.Duration
 
 @Service
 class TokenClient(
@@ -13,10 +12,7 @@ class TokenClient(
     @Value("\${token.service.url:http://localhost:8084}") private val tokenServiceUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val http: RestTemplate = restTemplateBuilder
-        .setConnectTimeout(Duration.ofSeconds(5))
-        .setReadTimeout(Duration.ofSeconds(5))
-        .build()
+    private val http: RestTemplate = restTemplateBuilder.build()
 
     data class CreatePaymentMethodRequest(
         val customerId: String?,

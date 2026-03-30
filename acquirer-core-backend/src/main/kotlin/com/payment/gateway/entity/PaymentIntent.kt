@@ -41,7 +41,7 @@ class PaymentIntent(
     @Column(length = 22)
     val statementDescriptor: String? = null,
 
-    @Column(columnDefinition = "JSONB")
+    @Column(columnDefinition = "TEXT")
     val metadata: String? = null,
 
     val customerEmail: String? = null,

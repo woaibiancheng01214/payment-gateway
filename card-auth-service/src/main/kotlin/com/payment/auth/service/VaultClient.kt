@@ -15,10 +15,7 @@ class VaultClient(
     @Value("\${vault.service.url:http://localhost:8086}") private val vaultServiceUrl: String
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val http: RestTemplate = restTemplateBuilder
-        .setConnectTimeout(Duration.ofSeconds(5))
-        .setReadTimeout(Duration.ofSeconds(5))
-        .build()
+    private val http: RestTemplate = restTemplateBuilder.build()
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "pciVaultCircuitBreaker",
