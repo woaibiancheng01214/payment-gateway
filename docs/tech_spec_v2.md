@@ -2,17 +2,16 @@
 
 ## 1. Overview
 
-A payment gateway system with six Kotlin/Spring Boot 3.2 microservices split into PCI and non-PCI zones, backed by PostgreSQL, Redis, Kafka, and Debezium CDC. All services run on JDK 17 with Gradle (Kotlin DSL).
+A payment gateway system with seven Kotlin/Spring Boot 3.2 microservices split into PCI and non-PCI zones, backed by PostgreSQL, Redis, Kafka, and Debezium CDC. All services run on JDK 17 with Gradle (Kotlin DSL).
 
 **Stack**
 | Layer | Technology |
 |---|---|
-| Backend | Kotlin 1.9 + Spring Boot 3.2 (6 microservices) |
-| Persistence | PostgreSQL 16 (5 databases, logical replication for CDC) |
+| Backend | Kotlin 1.9 + Spring Boot 3.2 (7 microservices) |
+| Persistence | PostgreSQL 16 (6 databases, logical replication for CDC) |
 | Cache / Locking | Redis 7 (idempotency cache + distributed locks) |
 | Messaging | Kafka (KRaft mode) + Debezium CDC |
 | Monitoring | Prometheus + Grafana + cAdvisor + postgres-exporter |
-| Frontend | React 18 + Vite |
 
 ---
 
@@ -55,6 +54,21 @@ PCI zone services have **no external port mappings** — accessible only within 
 | card-vault-service | PCI | 8086 (internal) | `card_vault` | Encrypted card data storage (AES-256-GCM) |
 | token-service | PCI | 8084 (internal) | `token_service` | Payment method references (brand, last4, expiry — no PAN) |
 | card-auth-service | PCI | 8085 (internal) | `card_auth` | Authorization/capture orchestration, gateway dispatch, InternalAttempt lifecycle |
+| merchant-service | Non-PCI | 8087 (external) | `merchant_service` | Merchant CRUD — all PaymentIntents scoped to a merchant |
+
+---
+
+## 2.1 System Requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| **CPU** | 2 cores | 4+ cores |
+| **RAM** | 6 GB | 8+ GB |
+| **Disk** | 10 GB | 20 GB |
+| **Docker** | Docker Compose v2, 4 GB allocated | Docker Compose v2, 6+ GB allocated |
+| **OS** | macOS 12+ / Linux (x86_64 or arm64) | macOS 14+ / Linux |
+
+The full stack runs 15 containers (7 application services + 8 infrastructure). Minimum spec runs all containers but with degraded throughput (~30 TPS). Recommended spec sustains 100 TPS with headroom for monitoring and CDC.
 
 ---
 
@@ -198,8 +212,8 @@ payment-gateway/
 │               ├── docker-containers.json # Container CPU/memory/network/disk
 │               └── postgres.json         # PG connections, txn rate, locks, cache
 │
-├── docker-compose.yml                    # Full stack: 6 services + infra + monitoring
-├── stress_test.py                        # 13-suite correctness + load test
+├── docker-compose.yml                    # Full stack: 7 services + infra + monitoring
+├── api_tests/                            # 27 integration tests across 6 modules
 └── docs/
     ├── tech_spec_v1.md
     └── tech_spec_v2.md                   # this file
@@ -380,7 +394,7 @@ Raw card data only enters `card-vault-service` (encrypted at rest with AES-256-G
 
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
-| postgres | postgres:16-alpine | 5432 | 5 databases, `wal_level=logical` |
+| postgres | postgres:16-alpine | 5432 | 6 databases, `wal_level=logical` |
 | redis | redis:7-alpine | 6379 | Distributed locking, idempotency cache |
 | kafka | cp-kafka:7.6.0 (KRaft) | 9092 | CDC event streaming |
 | debezium | debezium/connect:2.5 | 8083 | CDC connector |
@@ -391,16 +405,33 @@ Raw card data only enters `card-vault-service` (encrypted at rest with AES-256-G
 
 ### Resource Limits (Docker)
 
+| Container | CPU | Memory | HikariCP Pool | Tomcat Threads |
+|-----------|-----|--------|---------------|----------------|
+| postgres | 1.0 | 2 GB | — | — |
+| acquirer-core-backend | 1.0 | 1 GB | 80 (min 20) | 200 |
+| external-payment-gateway | 1.0 | 1 GB | — | 400 |
+| ledger-service | 1.0 | 1 GB | 10 | 200 |
+| card-auth-service | 1.0 | 1 GB | 30 (min 10) | 200 |
+| card-vault-service | 0.5 | 512 MB | 20 (min 5) | 200 |
+| token-service | 0.5 | 512 MB | 20 (min 5) | 200 |
+| merchant-service | 0.5 | 512 MB | 15 (min 5) | 200 |
+| cadvisor | 0.5 | 256 MB | — | — |
+
+### Idle Resource Usage (measured)
+
 | Container | CPU | Memory |
 |-----------|-----|--------|
-| postgres | 1.0 | 1 GB |
-| acquirer-core-backend | 1.0 | 1 GB |
-| external-payment-gateway | 1.0 | 1 GB |
-| ledger-service | 1.0 | 1 GB |
-| card-auth-service | 1.0 | 1 GB |
-| card-vault-service | 0.5 | 512 MB |
-| token-service | 0.5 | 512 MB |
-| cadvisor | 0.5 | 256 MB |
+| acquirer-core-backend | <1% | 553 MB / 1 GB |
+| card-auth-service | <2% | 357 MB / 1 GB |
+| external-payment-gateway | <5% | 236 MB / 1 GB |
+| ledger-service | <1% | 343 MB / 1 GB |
+| card-vault-service | <1% | 291 MB / 512 MB |
+| token-service | <1% | 307 MB / 512 MB |
+| merchant-service | <1% | 290 MB / 512 MB |
+| postgres | <4% | 587 MB / 2 GB |
+| kafka | <1% | 664 MB |
+| redis | <1% | 15 MB |
+| **Total (all 15 containers)** | | **~3.9 GB** |
 
 ---
 
@@ -453,6 +484,7 @@ All Spring Boot services expose `/actuator/prometheus` via Micrometer registry. 
 | Scheduler | Interval | Action |
 |-----------|----------|--------|
 | `sweepExpiredAuthAttempts` | 10s | Expires `REQUIRES_CONFIRMATION` intents older than 180s; calls auth-service to expire InternalAttempts |
+| `sweepUndispatchedConfirms` | 3s | Retries `dispatched=false` PaymentAttempts older than 10s (outbox retry for confirm dispatch) |
 
 ### card-auth-service
 
@@ -463,25 +495,85 @@ All Spring Boot services expose `/actuator/prometheus` via Micrometer registry. 
 
 ---
 
-## 12. Stress & Correctness Tests
+## 12. Integration Tests
 
-**File:** `stress_test.py` — 13 test suites.
+**Directory:** `api_tests/` — 27 tests across 6 modules.
 
-| # | Test | What it verifies |
-|---|---|---|
-| 1 | Throughput & latency | 40 sequential creates; P50/P95/P99; error rate |
-| 2 | Concurrent creates | 50 threads; no errors, no duplicate IDs |
-| 3 | Double-confirm race | 10 concurrent confirms on same intent → exactly 1 PaymentAttempt |
-| 4 | Idempotency correctness | Replay returns cache; different payload rejected |
-| 5 | Redis distributed lock on confirm | 80 concurrent confirms with Redis lock |
-| 6 | Double-capture race | 10 concurrent captures → exactly 1 capture InternalAttempt |
-| 7 | State machine guards | Capture on non-authorized intent → 409 |
-| 8 | Data consistency under load | 20 concurrent confirms; all consistent after webhooks settle |
-| 9 | Webhook replay | Duplicate webhook on terminal attempt → no-op |
-| 10 | Auth expiry | `card_hang` confirm → intent expires within timeout |
-| 11 | Late webhook blocked | Success webhook after expiry → status stays expired |
-| 12 | Dispatch retry | Verifies commit-first + dispatch-retry outbox pattern |
-| 13 | PCI service architecture | Validates PCI service split, tokenization, API accessibility |
+### test_payments.py (7 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_throughput_and_latencies` | 40 sequential creates; P50/P95/P99 latency |
+| `test_input_validation` | Create DTO: amount, currency, merchantId, description, email, statementDescriptor |
+| `test_confirm_input_validation` | Confirm DTO: cardNumber, expiryMonth (1-12), expiryYear, CVC length |
+| `test_state_machine_guards` | Capture on unconfirmed → 409; re-confirm on failed → 409 |
+| `test_capture_on_non_authorized_states` | Capture on requires_confirmation, failed, captured, expired → 409 with correct message |
+| `test_merchant_validation_on_list_endpoints` | Nonexistent merchant on list/cursor endpoints → 400 |
+| `test_openapi_docs_available` | OpenAPI docs at /api-docs for all external services |
+
+### test_concurrency.py (5 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_concurrent_creates` | 50 threads; no 5xx, no duplicate IDs |
+| `test_concurrent_confirm_redis_lock` | 80 concurrent confirms → exactly 1 PaymentAttempt (lock enforced) |
+| `test_idempotency_correctness` | Same key returns cache; different payload → 400; 10 concurrent replays consistent |
+| `test_concurrent_capture` | 10 concurrent captures → exactly 1 CAPTURE InternalAttempt |
+| `test_duplicate_confirm_sequential` | Second confirm on terminal intent → 409, no duplicate attempt |
+
+### test_security.py (6 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_webhook_replay` | Replay + different-status late webhook on terminal intent → status unchanged |
+| `test_pci_service_isolation` | PCI services (8084, 8085, 8086) not accessible from host |
+| `test_pci_tokenization_flow` | Raw PAN not in response; pm_ prefix; correct brand/last4 |
+| `test_webhook_signature_verification` | Correct HMAC accepted; wrong secret → 401 |
+| `test_webhook_missing_headers` | Missing signature/timestamp headers → 401 |
+| `test_webhook_timestamp_tolerance` | Stale timestamp (600s) → 401; recent (10s) → accepted |
+
+### test_load.py (4 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_outbox_dispatch_flag` | 5 intents confirmed → all have InternalAttempts (outbox dispatch working) |
+| `test_dispatch_retry` | 10 intents → all reach terminal via scheduler retry |
+| `test_expiry_auth_hang` | Auth timeout → intent expires (reads actual config from server) |
+| `test_sustained_load` | 100 TPS for 30s; consistency, ledger balance, merchant distribution |
+
+### test_ledger.py (2 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_ledger_consistency` | Global debit=credit; per-intent entry patterns; per-intent balance |
+| `test_dead_letter_api` | Dead-letter events API accessible |
+
+### test_observability.py (5 tests)
+
+| Test | What it verifies |
+|---|---|
+| `test_cursor_pagination` | Cursor pagination with limit, page2, merchant-scoped, invalid cursor |
+| `test_correlation_ids` | Auto-generated and echoed X-Correlation-Id |
+| `test_business_metrics` | 5 custom Prometheus metrics present |
+| `test_hikari_pool_metrics` | HikariCP pool max and active connections exposed |
+| `test_graceful_shutdown_config` | Health endpoint returns UP |
+
+### Measured Performance (4 CPU / 8 GB RAM, Colima on macOS)
+
+| Metric | Value |
+|--------|-------|
+| **Sustained throughput** | 100 TPS (3,100 intents in 30s) |
+| **Create latency** | P50 24ms, P95 159ms, P99 250ms |
+| **Confirm latency** | P50 1,008ms, P95 1,459ms, P99 1,796ms |
+| **Webhook drain time** | 23s for 3,100 intents to reach terminal |
+| **Terminal coverage** | 100% (authorized + failed + captured + expired) |
+| **Ledger consistency** | Debit = Credit invariant holds across all intents |
+| **Lock contention (80 threads)** | Exactly 1 PaymentAttempt; P50 rejection 71ms |
+| **Backend peak CPU (under load)** | 86% |
+| **Backend peak heap (under load)** | 377 MB / 1,511 MB |
+| **Gateway peak CPU (under load)** | 24% |
+
+Confirm latency is dominated by the 6-hop RPC chain and mock gateway ACK latency (P50 ~150ms, cap 2s). Real gateway integration would have different latency characteristics.
 
 ---
 
@@ -489,20 +581,23 @@ All Spring Boot services expose `/actuator/prometheus` via Micrometer registry. 
 
 ### Prerequisites
 
-- Docker Desktop (Docker Compose v2)
-- Python 3.10+ (for stress test)
-- Node.js 18+ (for frontend, optional)
+- Docker Desktop (Docker Compose v2) or Colima
+- Python 3.10+ (for integration tests)
 
 ### Full Stack (Recommended)
 
 ```bash
-# Start everything: 6 services + postgres + redis + kafka + debezium + monitoring
+# macOS with Colima (recommended: 4 CPU, 8 GB RAM)
+colima start --cpu 4 --memory 8
+
+# Start everything: 7 services + postgres + redis + kafka + debezium + monitoring
 docker-compose up -d --build
 
-# Wait ~60s for all services to initialize, then verify:
+# Wait ~30s for all services to initialize, then verify:
 curl http://localhost:8080/actuator/health   # acquirer-core-backend
 curl http://localhost:8081/actuator/health   # external-payment-gateway
 curl http://localhost:8082/actuator/health   # ledger-service
+curl http://localhost:8087/actuator/health   # merchant-service
 ```
 
 ### Monitoring
@@ -519,21 +614,26 @@ open http://localhost:9090
 curl http://localhost:8080/actuator/prometheus | head -20
 ```
 
-### Stress Test
+### Integration Tests
 
 ```bash
 # One-time setup
-python3 -m venv .venv
-.venv/bin/pip install requests
+pip install requests
 
-# Run all 13 suites
-.venv/bin/python3 stress_test.py
+# Run all 27 tests (including sustained load)
+python3 -m api_tests.run_all
 
-# Run only the sustained load test
-.venv/bin/python3 stress_test.py --stress
+# Quick mode (skip sustained load)
+python3 -m api_tests.run_all --quick
+
+# Stress only (sustained load + ledger)
+python3 -m api_tests.run_all --stress
+
+# Configurable load duration and TPS
+python3 -m api_tests.run_all --duration 120 --tps 200
 ```
 
-Watch the Grafana dashboards at `http://localhost:3000` in real-time while the stress test runs.
+Watch the Grafana dashboards at `http://localhost:3000` in real-time while the tests run.
 
 ### Individual Service (Local Dev)
 
@@ -545,13 +645,7 @@ cd ledger-service && ./gradlew bootRun           # port 8082
 cd card-vault-service && ./gradlew bootRun       # port 8086
 cd token-service && ./gradlew bootRun            # port 8084
 cd card-auth-service && ./gradlew bootRun        # port 8085
-```
-
-### Frontend
-
-```bash
-cd frontend && npm install && npm run dev
-# Opens at http://localhost:5173
+cd merchant-service && ./gradlew bootRun         # port 8087
 ```
 
 ### API Documentation
@@ -583,7 +677,7 @@ docker-compose down -v
 
 | Area | v1 | v2 |
 |------|----|----|
-| Services | 3 (checkout, gateway, ledger) | 6 (+card-vault, token, card-auth) |
+| Services | 3 (checkout, gateway, ledger) | 7 (+card-vault, token, card-auth, merchant) |
 | PCI isolation | None — PAN in checkout service | PCI zone: vault encrypts at rest, auth dispatches, no external ports |
 | Card storage | In-memory vault within checkout | Dedicated card-vault-service with AES-256-GCM |
 | Tokenization | None | token-service creates PaymentMethod (brand, last4, expiry) |
@@ -597,5 +691,5 @@ docker-compose down -v
 | Error responses | Per-controller | `ApiError` DTO via `@ControllerAdvice` |
 | Monitoring | None | Prometheus + Grafana + cAdvisor + postgres-exporter |
 | Webhook security | None | HMAC-SHA256 signature verification |
-| Stress tests | 10 suites | 13 suites (+Redis lock, +dispatch retry, +PCI architecture) |
+| Integration tests | 10 suites | 27 tests across 6 modules (payments, concurrency, security, load, ledger, observability) |
 | Dead letter handling | None | Dead letter events table with retry API |

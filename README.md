@@ -20,8 +20,8 @@ A production-grade payment orchestrator with auth/capture flow, 7 Kotlin/Spring 
 - **Resilience** -- Resilience4j circuit breakers (failure + slow-call detection), bulkhead-gated DB fallback, transactional outbox with at-least-once delivery, dead-letter auto-retry with exponential backoff
 - **PCI-modeled security** -- Card services isolated to internal Docker network (no external ports), AES-256-GCM encryption with versioned key rotation, HMAC-SHA256 webhook verification, PCI audit logging
 - **Observability** -- 3 auto-provisioned Grafana dashboards, 10+ Prometheus alert rules, correlation IDs across all 7 services, business-level SLIs (auth success rate, confirm P99)
-- **Performance** -- 76+ TPS sustained with connection-pooled HTTP clients, tuned HikariCP/PostgreSQL, Caffeine caching, cursor-based pagination
-- **Comprehensive testing** -- 6 API test modules covering concurrency, security, load, ledger consistency, and observability; standalone stress test suite
+- **Performance** -- 100 TPS sustained (3,100 intents in 30s), create P99 250ms, confirm P50 1s, connection-pooled HTTP clients, tuned HikariCP/PostgreSQL, Caffeine caching, cursor-based pagination
+- **Comprehensive testing** -- 27 integration tests across 6 modules covering concurrency, security, load, ledger consistency, and observability
 
 ---
 
@@ -69,9 +69,25 @@ PCI zone services have no external port mappings -- accessible only within the D
 
 ---
 
+## System Requirements
+
+| | Minimum | Recommended |
+|---|---|---|
+| **CPU** | 2 cores | 4+ cores |
+| **RAM** | 6 GB | 8+ GB |
+| **Disk** | 10 GB | 20 GB |
+| **Docker** | Docker Compose v2, 4 GB allocated | Docker Compose v2, 6+ GB allocated |
+| **OS** | macOS 12+ / Linux (x86_64 or arm64) | macOS 14+ / Linux |
+
+**Minimum** runs all 15 containers but may see degraded throughput (~30 TPS) and longer startup times. **Recommended** sustains 100 TPS with headroom for Grafana, Prometheus, and CDC processing.
+
+For macOS with Colima: `colima start --cpu 4 --memory 8`
+
+---
+
 ## Quick Start
 
-**Prerequisites:** Docker Desktop (Docker Compose v2)
+**Prerequisites:** Docker Desktop (Docker Compose v2) or Colima
 
 ```bash
 # Start the full stack (~2 min first build, ~30s subsequent)
@@ -202,25 +218,43 @@ PostgreSQL WAL --> Debezium --> Kafka --> ledger-service (double-entry posting)
 
 ## Testing
 
-| Category | What it verifies |
-|----------|-----------------|
-| Payments | CRUD, state machine transitions, validation, idempotency |
-| Concurrency | Double-confirm/capture races, distributed locks, 200 concurrent threads |
-| Security | HMAC verification, PCI port isolation, webhook replay rejection |
-| Load | 76+ TPS sustained for 30s, connection pool behavior, dispatch retry |
-| Ledger | Debit=credit invariant across 3,000+ intents, CDC consistency, dead-letter retry |
-| Observability | Correlation IDs, business metrics, Prometheus endpoints, cursor pagination |
+27 integration tests across 6 modules:
+
+| Category | Tests | What it verifies |
+|----------|-------|-----------------|
+| Payments | 7 | CRUD, state machine guards, input validation (create + confirm DTOs), merchant validation, capture error paths |
+| Concurrency | 5 | Double-confirm/capture races, distributed locks, 80-thread confirm contention, idempotency, duplicate confirm guard |
+| Security | 6 | HMAC verification, PCI port isolation, webhook replay/late webhook rejection, timestamp tolerance |
+| Load | 4 | 100 TPS sustained for 30s, outbox dispatch flag, dispatch-retry scheduler, auth expiry |
+| Ledger | 2 | Debit=credit invariant across 3,000+ intents, dead-letter API |
+| Observability | 5 | Correlation IDs, business metrics, HikariCP pool, cursor pagination, health checks |
 
 ```bash
 # Full stack must be running first
 docker-compose up -d
 
-# Run all API tests
-.venv/bin/python3 -m pytest api_tests/ -v
+# Run all tests (including sustained load)
+python3 -m api_tests.run_all
 
-# Run standalone stress test
-.venv/bin/python3 stress_test.py
+# Quick mode (skip sustained load test)
+python3 -m api_tests.run_all --quick
+
+# Stress only (sustained load + ledger)
+python3 -m api_tests.run_all --stress
 ```
+
+### Measured Performance (4 CPU / 8 GB RAM)
+
+| Metric | Value |
+|--------|-------|
+| Sustained throughput | 100 TPS (3,100 intents in 30s) |
+| Create latency | P50 24ms, P95 159ms, P99 250ms |
+| Confirm latency | P50 1,008ms, P95 1,459ms, P99 1,796ms |
+| Webhook drain time | 23s for 3,100 intents |
+| Terminal coverage | 100% (all intents reach terminal state) |
+| Ledger consistency | Debit = Credit across all intents |
+| Concurrent confirm (80 threads) | Exactly 1 PaymentAttempt, P50 lock rejection 71ms |
+| Idle memory (all services) | ~3.6 GB total |
 
 ---
 
@@ -250,8 +284,7 @@ payment-gateway/
   external-payment-gateway/    # Mock gateway simulator (Non-PCI, :8081)
   ledger-service/              # CDC-driven double-entry ledger (Non-PCI, :8082)
   merchant-service/            # Merchant CRUD (Non-PCI, :8087)
-  api_tests/                   # 6 test modules
-  stress_test.py               # Standalone stress test
+  api_tests/                   # 6 test modules, 27 tests
   infra/
     monitoring/                # Prometheus config, Grafana dashboards, alert rules
     secrets/                   # Docker secrets (encryption keys, webhook secret)
@@ -274,7 +307,7 @@ v1  Monolith with in-process mock         Found race conditions via stress test
 v2  + Pessimistic locking + idempotency   Fixed double-confirm, double-capture
 v3  + External gateway service            Discovered webhook-before-commit bug
 v4  + Transactional outbox                Eliminated silent payment loss on crash
-v5  + Redis locks + HMAC webhooks         100+ TPS sustained, secure webhooks
+v5  + Redis locks + HMAC webhooks         100 TPS sustained, secure webhooks
 v6  + Debezium CDC + Kafka + Ledger       Event-driven double-entry accounting
 v7  + Monitoring + consistency tests      End-to-end ledger validation
 v8  + PCI service split + Resilience4j    Circuit breakers, Flyway, ShedLock, 7 services
