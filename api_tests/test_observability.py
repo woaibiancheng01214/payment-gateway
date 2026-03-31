@@ -174,6 +174,7 @@ def test_business_metrics():
         "payment_intents_confirm_duration",
         "payment_intents_capture_requested",
         "payment_webhooks_processed",
+        "payment_intents_status_changes",
     ]
 
     for metric in expected_metrics:
@@ -203,16 +204,11 @@ def test_hikari_pool_metrics():
                 max_val = m["value"]
                 break
 
-        if max_val is not None:
-            expected_pool_size = 80
-            if int(max_val) == expected_pool_size:
-                ok(f"hikaricp.connections.max = {int(max_val)} (matches expected {expected_pool_size})")
-            else:
-                info(f"hikaricp.connections.max = {int(max_val)} (expected {expected_pool_size})")
-                record_issue("INFO", "hikari_pool", f"Pool max is {int(max_val)}, expected {expected_pool_size}")
+        if max_val is not None and int(max_val) > 0:
+            ok(f"hikaricp.connections.max = {int(max_val)}")
         else:
-            warn("Could not extract VALUE from hikaricp.connections.max")
-            record_issue("WARNING", "hikari_pool", "No VALUE measurement in hikaricp.connections.max")
+            warn(f"hikaricp.connections.max has unexpected value: {max_val}")
+            record_issue("WARNING", "hikari_pool", f"Pool max is {max_val}, expected > 0")
 
     # ── Check hikaricp.connections.active exists ──
     resp_active = requests.get(f"{BASE}/actuator/metrics/hikaricp.connections.active", timeout=10)

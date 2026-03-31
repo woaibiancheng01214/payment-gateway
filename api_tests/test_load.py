@@ -35,6 +35,61 @@ def _parse_tps() -> int:
     return int(os.environ.get("LOAD_TPS", "100"))
 
 
+def test_outbox_dispatch_flag():
+    """
+    Verifies the outbox pattern end-to-end:
+    1. Create + confirm 5 intents rapidly.
+    2. Wait for terminal states.
+    3. Verify each intent's PaymentAttempt has associated InternalAttempts,
+       proving dispatch happened (either immediately or via ConfirmDispatchScheduler).
+    """
+    COUNT = 5
+    print(f"\n{BOLD}── Test: Outbox Dispatch Flag ({COUNT} intents) ──{RESET}")
+
+    intent_ids = []
+    for i in range(COUNT):
+        intent = create_intent(amount=rand_amount(), currency=rand_currency())
+        r = confirm_intent(intent["id"])
+        if r.status_code < 300:
+            intent_ids.append(intent["id"])
+        else:
+            warn(f"Confirm failed for intent {intent['id']}: {r.status_code}")
+
+    info(f"Created+confirmed {len(intent_ids)} intents, waiting for terminal states...")
+
+    # Wait for all to reach terminal
+    deadline = time.time() + 150
+    terminal = set()
+    while time.time() < deadline and len(terminal) < len(intent_ids):
+        time.sleep(3)
+        for iid in intent_ids:
+            if iid in terminal:
+                continue
+            d = get_intent(iid)
+            if d["status"] in ("authorized", "failed", "captured", "expired"):
+                terminal.add(iid)
+
+    # Verify each intent has InternalAttempts (proves dispatch happened)
+    dispatched_count = 0
+    for iid in intent_ids:
+        d = get_intent(iid)
+        attempts = d.get("attempts", [])
+        if not attempts:
+            record_issue("CRITICAL", "outbox_dispatch", f"Intent {iid} has no PaymentAttempt")
+            continue
+        internals = attempts[0].get("internalAttempts", [])
+        if internals:
+            dispatched_count += 1
+        else:
+            record_issue("CRITICAL", "outbox_dispatch",
+                         f"Intent {iid} has no InternalAttempts (dispatch never happened)")
+
+    if dispatched_count == len(intent_ids):
+        ok(f"All {dispatched_count} intents have InternalAttempts (outbox dispatch working)")
+    else:
+        warn(f"Only {dispatched_count}/{len(intent_ids)} intents have InternalAttempts")
+
+
 def test_dispatch_retry():
     """
     Verifies the commit-first + dispatch-retry pattern:
@@ -85,17 +140,28 @@ def test_dispatch_retry():
                 info(f"  {iid[:8]}... → {d['status']} | IA status={internals[0]['status']}")
 
 
-def test_expiry_auth_hang(auth_timeout_s=30):
+def test_expiry_auth_hang():
     """
-    Simulate a gateway that never calls back by manually creating a PaymentAttempt
-    and then waiting for the scheduler to expire it.
-    We use a very short timeout config (30s) and actually wait for it.
-    This test only runs if the server's auth timeout is <= 45s.
+    Simulate a gateway that never calls back and wait for the scheduler to expire it.
+    Reads the actual auth timeout from the server's actuator/env endpoint.
+    Skips if the configured timeout exceeds 60s (too slow for integration tests).
+    To test expiry with short waits, set payment.timeout.auth-seconds=30 in application.properties.
     """
     print(f"\n{BOLD}── Test: Auth Expiry — intent expires if webhook never arrives ──{RESET}")
 
-    if auth_timeout_s > 45:
-        warn(f"Skipping — auth timeout is {auth_timeout_s}s (too long for a stress test run)")
+    # Read actual auth timeout from server config
+    auth_timeout_s = 30  # default
+    try:
+        r = requests.get(f"{BASE}/actuator/env/payment.timeout.auth-seconds", timeout=5)
+        if r.status_code == 200:
+            prop = r.json().get("property", {})
+            auth_timeout_s = int(prop.get("value", 30))
+            info(f"Server auth timeout: {auth_timeout_s}s")
+    except Exception:
+        info(f"Could not read auth timeout from actuator, assuming {auth_timeout_s}s")
+
+    if auth_timeout_s > 60:
+        warn(f"Skipping — auth timeout is {auth_timeout_s}s (set payment.timeout.auth-seconds<=60 to enable)")
         return
 
     intent = create_intent(amount=rand_amount(), currency=rand_currency())

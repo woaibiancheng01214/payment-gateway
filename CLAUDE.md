@@ -23,8 +23,8 @@ cd acquirer-core-backend && ./gradlew test
 # Full stack via Docker Compose (from repo root)
 docker-compose up -d
 
-# Run the stress/integration test (requires full stack running)
-.venv/bin/python3 stress_test.py
+# Run the integration test suite (requires full stack running)
+python3 -m api_tests.run_all
 ```
 
 Replace `acquirer-core-backend` with any service directory name as needed.

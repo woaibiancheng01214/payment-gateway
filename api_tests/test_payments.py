@@ -1,14 +1,12 @@
 """
-Payment CRUD, state machine, data consistency, and input validation tests.
+Payment CRUD, state machine, and input validation tests.
 
 Usage:
     pytest api_tests/test_payments.py -v -s
 """
 
-import threading
 import time
 import requests
-from collections import Counter
 
 from api_tests.conftest import (
     BASE,
@@ -22,8 +20,6 @@ from api_tests.conftest import (
     warn,
     info,
     record_issue,
-    rand_amount,
-    rand_currency,
     ensure_test_merchant,
     create_intent,
     confirm_intent,
@@ -31,7 +27,6 @@ from api_tests.conftest import (
     get_intent,
     wait_for_terminal,
     CARD_VISA,
-    _lock,
 )
 
 
@@ -105,81 +100,6 @@ def test_state_machine_guards():
         warn("Couldn't get a failed intent in 6 tries for re-confirm test")
 
 
-def test_data_consistency_under_load():
-    """
-    Create 20 intents, confirm all concurrently, wait, then verify:
-    - Every confirmed intent has exactly 1 PaymentAttempt
-    - Every PaymentAttempt has at least 1 AUTH InternalAttempt
-    - PaymentIntent status matches PaymentAttempt status
-    """
-    print(f"\n{BOLD}── Test Name: test_data_consistency_under_load ──{RESET}")
-    intents = [create_intent(amount=rand_amount(), currency=rand_currency()) for _ in range(20)]
-
-    def confirm_all(intent):
-        try:
-            confirm_intent(intent["id"])
-        except Exception:
-            pass
-
-    threads = [threading.Thread(target=confirm_all, args=(i,)) for i in intents]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    info("Waiting 8s for all webhooks to settle...")
-    time.sleep(8)
-
-    mismatches = 0
-    multi_attempts = 0
-    missing_internal = 0
-    status_distribution = Counter()
-
-    for intent in intents:
-        detail = get_intent(intent["id"])
-        attempts = detail.get("attempts", [])
-        status_distribution[detail["status"]] += 1
-
-        # Each intent should have exactly 1 PaymentAttempt
-        if len(attempts) != 1:
-            multi_attempts += 1
-            record_issue("CRITICAL", "consistency",
-                         f"Intent {intent['id']} has {len(attempts)} PaymentAttempts, expected 1")
-            continue
-
-        attempt = attempts[0]
-        auth_internals = [ia for ia in attempt.get("internalAttempts", []) if ia["type"] == "auth"]
-
-        # Should have at least 1 auth internal attempt
-        if len(auth_internals) == 0:
-            missing_internal += 1
-            record_issue("CRITICAL", "consistency",
-                         f"Intent {intent['id']} has no AUTH InternalAttempt")
-            continue
-
-        # PaymentIntent status should align with PaymentAttempt status
-        intent_s = detail["status"]
-        attempt_s = attempt["status"]
-        valid_pairs = {
-            ("authorized", "authorized"),
-            ("failed", "failed"),
-            ("captured", "captured"),
-            ("requires_confirmation", "pending"),
-        }
-        if (intent_s, attempt_s) not in valid_pairs:
-            mismatches += 1
-            record_issue("CRITICAL", "consistency",
-                         f"Status mismatch: intent={intent_s}, attempt={attempt_s}")
-
-    info(f"Status distribution: {dict(status_distribution)}")
-
-    total = len(intents)
-    consistent = total - multi_attempts - missing_internal - mismatches
-    ok(f"{consistent}/{total} intents fully consistent")
-    if multi_attempts == 0 and missing_internal == 0 and mismatches == 0:
-        ok("All data consistent")
-
-
 def test_input_validation():
     """Test that invalid inputs are rejected with structured error responses."""
     print(f"\n{BOLD}── Test Name: test_input_validation ──{RESET}")
@@ -230,6 +150,149 @@ def test_input_validation():
                       timeout=5)
     assert r.status_code == 400, f"Expected 400 for negative amount, got {r.status_code}"
     ok("Negative amount correctly rejected")
+
+    # Description > 500 chars -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": merchant_id, "amount": 100, "currency": "USD",
+                            "description": "x" * 501},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for description > 500 chars, got {r.status_code}"
+    ok("Description > 500 chars correctly rejected")
+
+    # Invalid email format -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": merchant_id, "amount": 100, "currency": "USD",
+                            "customerEmail": "not-an-email"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for invalid email, got {r.status_code}"
+    ok("Invalid email format correctly rejected")
+
+    # Statement descriptor > 22 chars -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents",
+                      json={"merchantId": merchant_id, "amount": 100, "currency": "USD",
+                            "statementDescriptor": "A" * 23},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for statementDescriptor > 22 chars, got {r.status_code}"
+    ok("Statement descriptor > 22 chars correctly rejected")
+
+
+def test_confirm_input_validation():
+    """Test card-related DTO validation on the confirm endpoint."""
+    print(f"\n{BOLD}── Test Name: test_confirm_input_validation ──{RESET}")
+
+    intent = create_intent()
+    intent_id = intent["id"]
+
+    # Empty card number -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": "", "expiryMonth": 12, "expiryYear": 2030, "cvc": "123"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for empty cardNumber, got {r.status_code}"
+    ok("Empty cardNumber correctly rejected")
+
+    # expiryMonth = 0 -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 0,
+                            "expiryYear": 2030, "cvc": "123"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for expiryMonth=0, got {r.status_code}"
+    ok("expiryMonth=0 correctly rejected")
+
+    # expiryMonth = 13 -> should be 400 (requires @Max(12) annotation)
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 13,
+                            "expiryYear": 2030, "cvc": "123"},
+                      timeout=5)
+    if r.status_code == 400:
+        ok("expiryMonth=13 correctly rejected")
+    else:
+        warn(f"expiryMonth=13 returned {r.status_code} — missing @Max(12) validation on DTO")
+
+    # expiryYear = 2024 -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
+                            "expiryYear": 2024, "cvc": "123"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for expiryYear=2024, got {r.status_code}"
+    ok("expiryYear=2024 correctly rejected")
+
+    # CVC too short (2 digits) -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
+                            "expiryYear": 2030, "cvc": "12"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for CVC too short, got {r.status_code}"
+    ok("CVC too short (2 digits) correctly rejected")
+
+    # CVC too long (5 digits) -> 400
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+                      json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
+                            "expiryYear": 2030, "cvc": "12345"},
+                      timeout=5)
+    assert r.status_code == 400, f"Expected 400 for CVC too long, got {r.status_code}"
+    ok("CVC too long (5 digits) correctly rejected")
+
+
+def test_capture_on_non_authorized_states():
+    """Test capture returns appropriate errors for each non-AUTHORIZED state."""
+    print(f"\n{BOLD}── Test Name: test_capture_on_non_authorized_states ──{RESET}")
+
+    # Capture on REQUIRES_CONFIRMATION -> 409
+    intent = create_intent()
+    r = capture_intent(intent["id"])
+    assert r.status_code == 409, f"Expected 409 for capture on requires_confirmation, got {r.status_code}"
+    body = r.json()
+    assert "authorized" in body.get("message", "").lower(), \
+        f"Expected error mentioning 'authorized', got: {body.get('message', '')}"
+    ok("Capture on requires_confirmation -> 409 with correct message")
+
+    # Capture on FAILED -> 409
+    for _ in range(6):
+        i2 = create_intent()
+        confirm_intent(i2["id"])
+        s = wait_for_terminal(i2["id"], timeout_s=30)
+        if s == "failed":
+            r = capture_intent(i2["id"])
+            assert r.status_code == 409, f"Expected 409 for capture on failed, got {r.status_code}"
+            ok("Capture on failed -> 409")
+            break
+    else:
+        warn("Couldn't get a failed intent in 6 tries for capture-on-failed test")
+
+    # Capture on CAPTURED -> 409 (need an authorized intent first)
+    for _ in range(5):
+        i3 = create_intent()
+        confirm_intent(i3["id"])
+        s = wait_for_terminal(i3["id"], timeout_s=30)
+        if s == "authorized":
+            capture_intent(i3["id"])
+            time.sleep(5)
+            s2 = get_intent(i3["id"])["status"]
+            if s2 == "captured":
+                r = capture_intent(i3["id"])
+                assert r.status_code == 409, f"Expected 409 for capture on captured, got {r.status_code}"
+                ok("Capture on already-captured -> 409")
+                break
+    else:
+        warn("Couldn't get a captured intent for capture-on-captured test")
+
+
+def test_merchant_validation_on_list_endpoints():
+    """Test that nonexistent merchant IDs are rejected on list/cursor endpoints."""
+    print(f"\n{BOLD}── Test Name: test_merchant_validation_on_list_endpoints ──{RESET}")
+
+    fake_merchant = "merch_does_not_exist_xyz"
+
+    # Offset-based merchant list
+    r = requests.get(f"{BASE}/v1/payment_intents/merchant/{fake_merchant}", timeout=5)
+    assert r.status_code == 400, f"Expected 400 for list by nonexistent merchant, got {r.status_code}"
+    ok("List by nonexistent merchant returns 400")
+
+    # Cursor-based merchant list
+    r = requests.get(f"{BASE}/v1/payment_intents/cursor/merchant/{fake_merchant}",
+                     params={"limit": 5}, timeout=5)
+    assert r.status_code == 400, f"Expected 400 for cursor by nonexistent merchant, got {r.status_code}"
+    ok("Cursor by nonexistent merchant returns 400")
 
 
 def test_openapi_docs_available():

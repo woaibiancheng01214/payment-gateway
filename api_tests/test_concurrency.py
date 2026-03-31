@@ -403,6 +403,49 @@ def test_concurrent_capture():
 
 
 # =============================================================================
+#  5. Duplicate Confirm (Sequential)
+# =============================================================================
+
+def test_duplicate_confirm_sequential():
+    """Verify that a second confirm on an already-confirmed intent is rejected."""
+    print(f"\n{BOLD}{'='*60}{RESET}")
+    print(f"{BOLD}  TEST: Duplicate Confirm (Sequential){RESET}")
+    print(f"{BOLD}{'='*60}{RESET}")
+
+    intent = create_intent()
+    intent_id = intent["id"]
+    info(f"Created intent {intent_id}")
+
+    # First confirm should succeed
+    r1 = confirm_intent(intent_id)
+    if r1.status_code != 200:
+        record_issue("CRITICAL", "duplicate_confirm", f"First confirm failed: {r1.status_code}")
+        return
+    ok("First confirm succeeded (200)")
+
+    # Wait for terminal state
+    status = wait_for_terminal(intent_id, timeout_s=30)
+    info(f"Intent reached terminal state: {status}")
+
+    # Second confirm should be rejected (intent no longer in REQUIRES_CONFIRMATION)
+    r2 = confirm_intent(intent_id)
+    if r2.status_code in (400, 409):
+        ok(f"Second confirm correctly rejected with {r2.status_code}")
+    else:
+        record_issue("CRITICAL", "duplicate_confirm",
+                     f"Second confirm returned {r2.status_code}, expected 400 or 409")
+
+    # Verify still exactly 1 PaymentAttempt
+    detail = get_intent(intent_id)
+    attempts = detail.get("attempts", [])
+    if len(attempts) == 1:
+        ok("Exactly 1 PaymentAttempt (no duplicate created)")
+    else:
+        record_issue("CRITICAL", "duplicate_confirm",
+                     f"Expected 1 PaymentAttempt, found {len(attempts)}")
+
+
+# =============================================================================
 #  Run all
 # =============================================================================
 
@@ -412,4 +455,5 @@ if __name__ == "__main__":
     test_concurrent_confirm_redis_lock()
     test_idempotency_correctness()
     test_concurrent_capture()
+    test_duplicate_confirm_sequential()
     exit(print_results())

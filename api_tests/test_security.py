@@ -66,59 +66,20 @@ def test_webhook_replay():
         fail(f"Status changed after replay: {original_status} -> {after_status}")
         record_issue("CRITICAL", "webhook_replay", f"Replay changed status from {original_status} to {after_status}")
 
-
-def test_late_webhook_after_terminal():
-    """Send a late webhook after intent reaches terminal state and verify no change."""
-    print(f"\n{BOLD}{'─'*60}{RESET}")
-    print(f"{BOLD}  TEST: Late Webhook After Terminal State{RESET}")
-    print(f"{BOLD}{'─'*60}{RESET}")
-
-    intent = create_intent()
-    intent_id = intent["id"]
-    info(f"Created intent {intent_id}")
-
-    resp = confirm_intent(intent_id)
-    resp.raise_for_status()
-    info("Intent confirmed, waiting 3s...")
-
-    time.sleep(3)
-
-    detail_resp = requests.get(f"{BASE}/v1/payment_intents/{intent_id}", timeout=10)
-    detail_resp.raise_for_status()
-    detail_data = detail_resp.json()
-    current_status = detail_data["status"]
-    info(f"Current status after 3s: {current_status}")
-
-    if current_status == "requires_confirmation":
-        warn("Intent still not terminal after 3s, skipping late webhook test")
-        record_issue("INFO", "late_webhook", "Intent not terminal after 3s wait")
-        return
-
-    ia_id = None
-    for attempt in detail_data.get("attempts", []):
-        for ia in attempt.get("internalAttempts", []):
-            ia_id = ia["id"]
-            break
-        if ia_id:
-            break
-
-    if not ia_id:
-        warn("No InternalAttempt found, cannot test late webhook")
-        record_issue("WARNING", "late_webhook", "No InternalAttempt in detail response")
-        return
-
-    info(f"Sending late 'success' webhook for InternalAttempt {ia_id}")
-    late_resp = signed_webhook_post(ia_id, "success")
+    # Also send a webhook with a *different* status and verify no change
+    opposite_status = "failure" if original_status == "authorized" else "success"
+    info(f"Sending late webhook with different status '{opposite_status}' for InternalAttempt {ia_id}")
+    late_resp = signed_webhook_post(ia_id, opposite_status)
     info(f"Late webhook response status: {late_resp.status_code}")
 
-    after = get_intent(intent_id)
-    after_status = after["status"]
+    after_late = get_intent(intent_id)
+    after_late_status = after_late["status"]
 
-    if after_status == current_status:
-        ok(f"Status unchanged after late webhook: {after_status}")
+    if after_late_status == original_status:
+        ok(f"Status unchanged after late webhook with different status: {after_late_status}")
     else:
-        fail(f"Status changed after late webhook: {current_status} -> {after_status}")
-        record_issue("CRITICAL", "late_webhook", f"Late webhook changed status from {current_status} to {after_status}")
+        fail(f"Status changed after late webhook: {original_status} -> {after_late_status}")
+        record_issue("CRITICAL", "webhook_replay", f"Late webhook changed status from {original_status} to {after_late_status}")
 
 
 def test_pci_service_isolation():
@@ -274,14 +235,67 @@ def test_webhook_missing_headers():
         record_issue("CRITICAL", "webhook_missing_headers", f"Missing headers returned {resp.status_code} instead of 401")
 
 
+def test_webhook_timestamp_tolerance():
+    """Test that webhooks with stale timestamps are rejected."""
+    print(f"\n{BOLD}{'─'*60}{RESET}")
+    print(f"{BOLD}  TEST: Webhook Timestamp Tolerance{RESET}")
+    print(f"{BOLD}{'─'*60}{RESET}")
+
+    dummy_ia_id = "ia_test_timestamp_tolerance"
+    payload = {"internalAttemptId": dummy_ia_id, "status": "success"}
+    body = json.dumps(payload)
+
+    # Timestamp 600s in the past (outside 300s tolerance window)
+    old_timestamp = str(int(time.time()) - 600)
+    signature = hmac.new(
+        WEBHOOK_SECRET.encode(), f"{old_timestamp}.{body}".encode(), hashlib.sha256
+    ).hexdigest()
+    resp = requests.post(
+        f"{BASE}/v1/webhooks/gateway",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Gateway-Signature": signature,
+            "X-Gateway-Timestamp": old_timestamp,
+        },
+        timeout=5,
+    )
+    if resp.status_code == 401:
+        ok("Stale timestamp (600s old) correctly rejected with 401")
+    else:
+        fail(f"Stale timestamp returned {resp.status_code}, expected 401")
+        record_issue("CRITICAL", "webhook_timestamp", f"Stale timestamp returned {resp.status_code} instead of 401")
+
+    # Timestamp 10s in the past (within tolerance window) — should NOT be 401
+    recent_timestamp = str(int(time.time()) - 10)
+    recent_signature = hmac.new(
+        WEBHOOK_SECRET.encode(), f"{recent_timestamp}.{body}".encode(), hashlib.sha256
+    ).hexdigest()
+    resp2 = requests.post(
+        f"{BASE}/v1/webhooks/gateway",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Gateway-Signature": recent_signature,
+            "X-Gateway-Timestamp": recent_timestamp,
+        },
+        timeout=5,
+    )
+    if resp2.status_code != 401:
+        ok(f"Recent timestamp (10s old) accepted (status {resp2.status_code})")
+    else:
+        fail("Recent timestamp (10s old) rejected with 401 — tolerance window too tight")
+        record_issue("CRITICAL", "webhook_timestamp", "Recent 10s timestamp rejected with 401")
+
+
 if __name__ == "__main__":
     reset_issues()
 
     test_webhook_replay()
-    test_late_webhook_after_terminal()
     test_pci_service_isolation()
     test_pci_tokenization_flow()
     test_webhook_signature_verification()
     test_webhook_missing_headers()
+    test_webhook_timestamp_tolerance()
 
     print_results()

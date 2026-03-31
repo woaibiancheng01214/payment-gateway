@@ -19,8 +19,10 @@ from api_tests.conftest import BOLD, RESET, print_results, reset_issues, record_
 from api_tests.test_payments import (
     test_throughput_and_latencies,
     test_state_machine_guards,
-    test_data_consistency_under_load,
     test_input_validation,
+    test_confirm_input_validation,
+    test_capture_on_non_authorized_states,
+    test_merchant_validation_on_list_endpoints,
     test_openapi_docs_available,
 )
 from api_tests.test_concurrency import (
@@ -28,14 +30,15 @@ from api_tests.test_concurrency import (
     test_concurrent_confirm_redis_lock,
     test_idempotency_correctness,
     test_concurrent_capture,
+    test_duplicate_confirm_sequential,
 )
 from api_tests.test_security import (
     test_webhook_replay,
-    test_late_webhook_after_terminal,
     test_pci_service_isolation,
     test_pci_tokenization_flow,
     test_webhook_signature_verification,
     test_webhook_missing_headers,
+    test_webhook_timestamp_tolerance,
 )
 from api_tests.test_observability import (
     test_cursor_pagination,
@@ -45,6 +48,7 @@ from api_tests.test_observability import (
     test_graceful_shutdown_config,
 )
 from api_tests.test_load import (
+    test_outbox_dispatch_flag,
     test_dispatch_retry,
     test_expiry_auth_hang,
     test_sustained_load,
@@ -80,21 +84,24 @@ def main():
             # Payments
             test_throughput_and_latencies,
             test_input_validation,
+            test_confirm_input_validation,
             test_state_machine_guards,
-            test_data_consistency_under_load,
+            test_capture_on_non_authorized_states,
+            test_merchant_validation_on_list_endpoints,
             test_openapi_docs_available,
             # Concurrency
             test_concurrent_creates,
             test_concurrent_confirm_redis_lock,
             test_idempotency_correctness,
             test_concurrent_capture,
+            test_duplicate_confirm_sequential,
             # Security
             test_webhook_replay,
-            test_late_webhook_after_terminal,
             test_pci_service_isolation,
             test_pci_tokenization_flow,
             test_webhook_signature_verification,
             test_webhook_missing_headers,
+            test_webhook_timestamp_tolerance,
             # Observability
             test_cursor_pagination,
             test_correlation_ids,
@@ -102,6 +109,7 @@ def main():
             test_hikari_pool_metrics,
             test_graceful_shutdown_config,
             # Load (without sustained)
+            test_outbox_dispatch_flag,
             test_dispatch_retry,
             test_expiry_auth_hang,
             # Ledger
@@ -113,21 +121,24 @@ def main():
             # Payments
             test_throughput_and_latencies,
             test_input_validation,
+            test_confirm_input_validation,
             test_state_machine_guards,
-            test_data_consistency_under_load,
+            test_capture_on_non_authorized_states,
+            test_merchant_validation_on_list_endpoints,
             test_openapi_docs_available,
             # Concurrency
             test_concurrent_creates,
             test_concurrent_confirm_redis_lock,
             test_idempotency_correctness,
             test_concurrent_capture,
+            test_duplicate_confirm_sequential,
             # Security
             test_webhook_replay,
-            test_late_webhook_after_terminal,
             test_pci_service_isolation,
             test_pci_tokenization_flow,
             test_webhook_signature_verification,
             test_webhook_missing_headers,
+            test_webhook_timestamp_tolerance,
             # Observability
             test_cursor_pagination,
             test_correlation_ids,
@@ -135,6 +146,7 @@ def main():
             test_hikari_pool_metrics,
             test_graceful_shutdown_config,
             # Load
+            test_outbox_dispatch_flag,
             test_dispatch_retry,
             test_expiry_auth_hang,
             test_sustained_load,

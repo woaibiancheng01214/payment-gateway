@@ -6,6 +6,7 @@ import com.payment.gateway.entity.Currency
 import com.payment.gateway.entity.PaymentAttempt
 import com.payment.gateway.entity.PaymentIntent
 import jakarta.validation.constraints.Email
+import jakarta.validation.constraints.Max
 import jakarta.validation.constraints.Min
 import jakarta.validation.constraints.NotBlank
 import jakarta.validation.constraints.Size
@@ -44,6 +45,7 @@ data class ConfirmPaymentIntentRequest(
     val cardholderName: String? = null,
 
     @field:Min(value = 1, message = "Expiry month must be between 1 and 12")
+    @field:Max(value = 12, message = "Expiry month must be between 1 and 12")
     val expiryMonth: Int,
 
     @field:Min(value = 2025, message = "Expiry year must be current year or later")
