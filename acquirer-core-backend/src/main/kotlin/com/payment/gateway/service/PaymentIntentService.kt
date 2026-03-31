@@ -13,7 +13,6 @@ import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.data.domain.Page
 import org.springframework.data.domain.Pageable
 import org.springframework.stereotype.Service
-import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.support.TransactionTemplate
 import java.time.Instant
 
@@ -137,6 +136,15 @@ class PaymentIntentService(
 
     // ── Confirm ─────────────────────────────────────────────────────────────
 
+    private data class ConfirmTxResult(
+        val response: PaymentIntentResponse,
+        val attemptId: String,
+        val paymentMethodId: String,
+        val amount: Long,
+        val currency: String,
+        val alreadyExisted: Boolean
+    )
+
     fun confirmPaymentIntent(
         intentId: String,
         request: ConfirmPaymentIntentRequest
@@ -165,7 +173,7 @@ class PaymentIntentService(
                 expYear = request.expiryYear
             )
 
-            val response = transactionTemplate.execute {
+            val txResult = transactionTemplate.execute {
                 val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                     .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
@@ -176,7 +184,14 @@ class PaymentIntentService(
                 val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 if (existingAttempt != null) {
                     log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
-                    return@execute intent.toResponse()
+                    return@execute ConfirmTxResult(
+                        response = intent.toResponse(),
+                        attemptId = existingAttempt.id,
+                        paymentMethodId = paymentMethodId,
+                        amount = intent.amount,
+                        currency = intent.currency.name,
+                        alreadyExisted = true
+                    )
                 }
 
                 val attempt = PaymentAttempt(
@@ -188,17 +203,27 @@ class PaymentIntentService(
                 )
                 paymentAttemptRepository.save(attempt)
 
-                // Dispatch to card-auth-service (outside transaction)
+                ConfirmTxResult(
+                    response = intent.toResponse(),
+                    attemptId = attempt.id,
+                    paymentMethodId = paymentMethodId,
+                    amount = intent.amount,
+                    currency = intent.currency.name,
+                    alreadyExisted = false
+                )
+            }!!
+
+            // Dispatch to card-auth-service AFTER transaction commits (connection released)
+            if (!txResult.alreadyExisted) {
                 try {
-                    authClient.confirm(intentId, paymentMethodId, attempt.id, intent.amount, intent.currency.name)
+                    authClient.confirm(intentId, txResult.paymentMethodId, txResult.attemptId, txResult.amount, txResult.currency)
+                    markAttemptDispatched(txResult.attemptId)
                 } catch (e: Exception) {
                     log.warn("Auth-service dispatch failed for intent $intentId — scheduler will retry: ${e.message}")
                 }
+            }
 
-                intent.toResponse()
-            }!!
-
-            return response
+            return txResult.response
         } finally {
             lockManager.releaseLock(intentId, lockResult)
             sample.stop(confirmTimer)
@@ -207,9 +232,16 @@ class PaymentIntentService(
 
     // ── Capture ─────────────────────────────────────────────────────────────
 
+    private data class CaptureTxResult(
+        val response: PaymentIntentResponse,
+        val attemptId: String,
+        val amount: Long,
+        val currency: String
+    )
+
     fun capturePaymentIntent(intentId: String): PaymentIntentResponse {
         captureCounter.increment()
-        val response = transactionTemplate.execute {
+        val txResult = transactionTemplate.execute {
             val intent = paymentIntentRepository.findByIdForUpdate(intentId)
                 .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
 
@@ -223,24 +255,29 @@ class PaymentIntentService(
             val attempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 ?: throw IllegalStateException("No PaymentAttempt found for intent $intentId")
 
-            try {
-                authClient.capture(attempt.id, intent.amount, intent.currency.name)
-            } catch (e: Exception) {
-                log.warn("Auth-service capture dispatch failed for intent $intentId: ${e.message}")
-            }
-
-            intent.toResponse()
+            CaptureTxResult(
+                response = intent.toResponse(),
+                attemptId = attempt.id,
+                amount = intent.amount,
+                currency = intent.currency.name
+            )
         }!!
 
-        return response
+        // Dispatch capture to card-auth-service AFTER transaction commits
+        try {
+            authClient.capture(txResult.attemptId, txResult.amount, txResult.currency)
+        } catch (e: Exception) {
+            log.warn("Auth-service capture dispatch failed for intent $intentId: ${e.message}")
+        }
+
+        return txResult.response
     }
 
     // ── Webhook handling ────────────────────────────────────────────────────
 
-    @Transactional
     fun handleWebhook(internalAttemptId: String, gatewayStatus: String) {
         webhookCounter.increment()
-        // Forward to auth-service to process InternalAttempt
+        // Forward to auth-service to process InternalAttempt (outside transaction)
         val result = authClient.processWebhook(internalAttemptId, gatewayStatus)
 
         if (!result.shouldUpdate) {
@@ -248,15 +285,18 @@ class PaymentIntentService(
             return
         }
 
-        val attempt = paymentAttemptRepository.findById(result.paymentAttemptId)
-            .orElseThrow { IllegalStateException("PaymentAttempt ${result.paymentAttemptId} not found") }
+        // DB mutations inside transaction
+        transactionTemplate.execute {
+            val attempt = paymentAttemptRepository.findById(result.paymentAttemptId)
+                .orElseThrow { IllegalStateException("PaymentAttempt ${result.paymentAttemptId} not found") }
 
-        val intent = paymentIntentRepository.findByIdForUpdate(attempt.paymentIntentId)
-            .orElseThrow { IllegalStateException("PaymentIntent not found") }
+            val intent = paymentIntentRepository.findByIdForUpdate(attempt.paymentIntentId)
+                .orElseThrow { IllegalStateException("PaymentIntent not found") }
 
-        when (result.type) {
-            "auth" -> handleAuthWebhook(attempt, intent, result.resolvedStatus)
-            "capture" -> handleCaptureWebhook(attempt, intent, result.resolvedStatus)
+            when (result.type) {
+                "auth" -> handleAuthWebhook(attempt, intent, result.resolvedStatus)
+                "capture" -> handleCaptureWebhook(attempt, intent, result.resolvedStatus)
+            }
         }
     }
 
@@ -307,7 +347,21 @@ class PaymentIntentService(
         }
     }
 
+    // ── Dispatch helpers ──────────────────────────────────────────────────
+
+    fun markAttemptDispatched(attemptId: String) {
+        transactionTemplate.execute {
+            paymentAttemptRepository.markDispatched(attemptId, Instant.now())
+        }
+    }
+
     // ── Reads ───────────────────────────────────────────────────────────────
+
+    fun getPaymentIntentSummary(intentId: String): PaymentIntentResponse {
+        val intent = paymentIntentRepository.findById(intentId)
+            .orElseThrow { IllegalArgumentException("PaymentIntent $intentId not found") }
+        return intent.toResponse()
+    }
 
     fun getPaymentIntentDetail(intentId: String): PaymentIntentDetailResponse {
         val intent = paymentIntentRepository.findById(intentId)

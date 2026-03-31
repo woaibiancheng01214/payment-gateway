@@ -110,3 +110,48 @@ query or missing index.
 **Takeaway:** Size HikariCP's `maximum-pool-size` for your peak concurrent *connection holders*,
 not your peak TPS. Account for pessimistic locks and long-running transactions holding
 connections longer than simple queries.
+
+---
+
+## 58. Load test drain/validation must not use expensive endpoints
+
+The load test's drain phase polled each intent via `GET /v1/payment_intents/{id}` — the
+detail endpoint that does 2 DB queries + 1 RPC to card-auth-service for InternalAttempts.
+At 200 TPS producing 120K+ intents, the drain was overwhelmed:
+
+- 500 batch × 50 workers = 500 concurrent detail requests hitting the backend
+- Backend still processing incoming webhooks simultaneously
+- Result: drain found only 2.6% terminal after 600s
+
+**Fix:** Added a lightweight `GET /v1/payment_intents/{id}/summary` endpoint that returns
+`PaymentIntentResponse` (single DB read, no auth-service RPC). Used `get_intent_status()`
+for drain polling, reserving the expensive `get_intent()` for validation only.
+
+Also made drain and validation sample-based for large runs (5K sample for drain, 2K for
+validation) instead of exhaustive, with configurable TPS via `--tps` and duration via
+`--duration` CLI args.
+
+**Takeaway:** Load test infrastructure must be designed for the scale you're testing at.
+An O(n) validation phase that worked at 1K intents becomes a bottleneck at 100K+. Sample
+and use lightweight endpoints.
+
+---
+
+## 59. JIT compilation causes a 30-second CPU spike at load start
+
+At 200 TPS, all services showed ~100% CPU for the first 30 seconds, then dropped to
+20-40% for the remainder of the test. This caused 5xx errors when 200 TPS was applied
+immediately (cold JVM).
+
+**Cause:** The JVM starts by interpreting bytecode. The C1/C2 JIT compilers activate
+when methods become "hot" (called frequently). At 200 TPS, hundreds of code paths —
+Spring MVC, Hibernate, Jackson, HikariCP — become hot simultaneously, triggering a
+compilation storm.
+
+**Fix:** Added a warmup phase to the load test: 20 TPS for 10 seconds before full load.
+This triggers JIT compilation on the critical paths without overwhelming the services.
+Result: 0 5xx errors at test start.
+
+**Takeaway:** Never slam full production load onto a cold JVM. Use a ramp-up period
+or pre-warm the service with synthetic traffic. In production, rolling deployments
+should drain old instances gradually while new instances warm up.

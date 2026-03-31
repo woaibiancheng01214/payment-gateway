@@ -17,7 +17,8 @@ enum class PaymentAttemptStatus {
     name = "payment_attempts",
     indexes = [
         Index(name = "idx_pa_intent_id", columnList = "paymentIntentId"),
-        Index(name = "idx_pa_intent_id_created", columnList = "paymentIntentId, createdAt")
+        Index(name = "idx_pa_intent_id_created", columnList = "paymentIntentId, createdAt"),
+        Index(name = "idx_pa_dispatched_status_created", columnList = "dispatched, status, createdAt")
     ]
 )
 class PaymentAttempt(
@@ -38,6 +39,9 @@ class PaymentAttempt(
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     var status: PaymentAttemptStatus = PaymentAttemptStatus.PENDING,
+
+    @Column(nullable = false)
+    var dispatched: Boolean = false,
 
     @Column(nullable = false)
     val createdAt: Instant = Instant.now(),

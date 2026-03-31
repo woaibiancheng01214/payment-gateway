@@ -53,6 +53,20 @@ interface PaymentIntentRepository : JpaRepository<PaymentIntent, String> {
 interface PaymentAttemptRepository : JpaRepository<PaymentAttempt, String> {
     fun findByPaymentIntentId(paymentIntentId: String): List<PaymentAttempt>
     fun findTopByPaymentIntentIdOrderByCreatedAtDesc(paymentIntentId: String): PaymentAttempt?
+
+    @Query("""
+        SELECT pa FROM PaymentAttempt pa
+        WHERE pa.dispatched = false
+          AND pa.status = 'PENDING'
+          AND pa.createdAt < :before
+        ORDER BY pa.createdAt ASC
+        LIMIT :limit
+    """)
+    fun findUndispatched(before: Instant, limit: Int = 50): List<PaymentAttempt>
+
+    @org.springframework.data.jpa.repository.Modifying
+    @Query("UPDATE PaymentAttempt pa SET pa.dispatched = true, pa.updatedAt = :now WHERE pa.id = :id")
+    fun markDispatched(id: String, now: Instant)
 }
 
 @Repository

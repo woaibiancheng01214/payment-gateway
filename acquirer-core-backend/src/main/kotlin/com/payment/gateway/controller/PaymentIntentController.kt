@@ -46,6 +46,12 @@ class PaymentIntentController(
         return ResponseEntity.ok(response)
     }
 
+    @GetMapping("/{id}/summary")
+    fun getSummary(@PathVariable id: String): ResponseEntity<PaymentIntentResponse> {
+        val response = paymentIntentService.getPaymentIntentSummary(id)
+        return ResponseEntity.ok(response)
+    }
+
     @GetMapping
     fun list(@PageableDefault(size = 20) pageable: Pageable): ResponseEntity<Page<PaymentIntentResponse>> {
         return ResponseEntity.ok(paymentIntentService.listPaymentIntents(pageable))

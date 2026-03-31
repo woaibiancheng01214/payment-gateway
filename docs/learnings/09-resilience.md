@@ -165,3 +165,59 @@ the downstream service has recovered.
 **Takeaway:** A circuit breaker without slow-call detection is half a circuit breaker.
 Degraded performance is a more common failure mode than complete outage, and it's more
 dangerous because it's invisible to failure-only metrics.
+
+---
+
+## 56. Circuit breakers on critical-path dependencies block all traffic when they open
+
+AuthClient, VaultClient, and TokenClient were all given identical circuit breakers. But
+vault and token are on the **critical path** of `confirmPaymentIntent` — without a card
+data ID and payment method, the confirm cannot proceed. When the vault circuit breaker
+opens, ALL confirms fail, even though the vault may recover in seconds.
+
+**The distinction:**
+
+| Dependency | Path | Circuit breaker? | Why |
+|---|---|---|---|
+| vault-service | Critical (confirm) | **No** — retry only | CB open = all confirms dead |
+| token-service | Critical (confirm) | **No** — retry only | CB open = all confirms dead |
+| auth-service confirm | Non-critical (outbox) | Yes | Scheduler retries later |
+| auth-service webhook | Non-critical (re-delivered) | Yes | Gateway re-delivers |
+| merchant-service | Validation only | Cache + fail-open | CB open blocks all creates |
+
+For critical-path dependencies, use **retry with exponential backoff** (3 attempts,
+500ms → 1s) to handle transient failures. Let persistent failures bubble up as 503 to
+the client, who can retry the whole operation.
+
+For non-critical dispatches with outbox/retry patterns, circuit breakers are appropriate
+because the scheduler will retry independently.
+
+**Takeaway:** Circuit breakers are for protecting against cascading failures from
+non-critical dependencies. On the critical path, a circuit breaker that blocks all
+traffic is worse than the failure it's trying to prevent.
+
+---
+
+## 57. Outbox pattern for confirm dispatch — at-least-once delivery guarantee
+
+If `authClient.confirm()` fails after PaymentAttempt is committed, the attempt is
+silently lost — card-auth-service never knows about it. Unlike card-auth-service
+(which has an outbox pattern with `InternalAttempt.dispatched` + sweep scheduler),
+acquirer-core-backend had no retry mechanism for the initial confirm dispatch.
+
+**Fix:** Added outbox pattern mirroring card-auth-service:
+
+1. **V8 migration:** `ALTER TABLE payment_attempts ADD COLUMN dispatched BOOLEAN NOT NULL DEFAULT FALSE`
+2. **Entity:** `dispatched` field on `PaymentAttempt`
+3. **Repository:** `findUndispatched(before, limit)` + `markDispatched(id, now)`
+4. **Dispatch flow:** After `authClient.confirm()` succeeds, call `markDispatched()`
+5. **Scheduler:** `ConfirmDispatchScheduler` sweeps every 3s (ShedLock-protected),
+   finds PENDING + undispatched + older than 10s, retries `authClient.confirm()`
+
+**The guarantee:** If the JVM crashes after PaymentAttempt is committed but before
+`authClient.confirm()` succeeds, the scheduler picks it up within 10-13 seconds and
+retries. The card-auth-service handles duplicates via its own idempotency logic.
+
+**Takeaway:** Any fire-and-forget RPC call after a database commit needs an outbox
+pattern. "Log a warning and hope the scheduler catches it" is not a retry strategy
+if there's no scheduler watching.

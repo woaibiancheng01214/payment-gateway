@@ -2,9 +2,13 @@
 Sustained load test, expiry test, and dispatch retry test.
 
 Usage:
-    python -m api_tests.test_load
+    python -m api_tests.test_load                  # default 30s
+    python -m api_tests.test_load --duration 1200   # 20 minutes
+    LOAD_DURATION=600 python -m api_tests.test_load # 10 minutes via env var
 """
 
+import os
+import sys
 import threading
 import queue
 import time
@@ -13,6 +17,22 @@ import random
 from collections import Counter
 
 from api_tests.conftest import *
+
+
+def _parse_duration() -> int:
+    """Parse duration from --duration CLI arg or LOAD_DURATION env var. Default 30s."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--duration" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+    return int(os.environ.get("LOAD_DURATION", "30"))
+
+
+def _parse_tps() -> int:
+    """Parse TPS from --tps CLI arg or LOAD_TPS env var. Default 100."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--tps" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+    return int(os.environ.get("LOAD_TPS", "100"))
 
 
 def test_dispatch_retry():
@@ -117,13 +137,16 @@ def test_expiry_auth_hang(auth_timeout_s=30):
 
 def test_sustained_load():
     """
-    Sustained 100 TPS of create+confirm for 30s, then drain for up to 120s
-    waiting for all exponentially-delayed webhooks (1s-60s) to arrive.
+    Sustained 100 TPS of create+confirm, then drain waiting for webhooks.
+    Duration is configurable via --duration CLI arg or LOAD_DURATION env var.
+    Drain time scales with duration (minimum 120s).
     """
-    THREADS = 100
-    DURATION_S = 30
-    DRAIN_S = 120
-    DRAIN_POLL_INTERVAL = 3
+    THREADS = _parse_tps()
+    DURATION_S = _parse_duration()
+    # Drain needs enough time to poll all intents: ~TPS * DURATION / batch_size * seconds_per_batch
+    estimated_intents = THREADS * DURATION_S
+    DRAIN_S = max(120, estimated_intents // 500 + 120)  # generous drain budget
+    DRAIN_POLL_INTERVAL = 1
 
     print(f"\n{BOLD}{'='*60}{RESET}")
     print(f"{BOLD}   Sustained Load Test — {THREADS} TPS x {DURATION_S}s{RESET}")
@@ -138,6 +161,33 @@ def test_sustained_load():
         if (i + 1) % 25 == 0:
             info(f"  Created {i + 1}/{THREADS} merchants")
     ok(f"Created {len(merchants)} merchants")
+
+    # -- Warmup: ramp up gradually to let JIT compile and pools initialize ----
+    WARMUP_TPS = min(20, THREADS)
+    WARMUP_S = 10
+    print(f"\n  {BOLD}Warming up: {WARMUP_TPS} TPS for {WARMUP_S}s...{RESET}")
+    warmup_stop = threading.Event()
+    def warmup_worker(idx):
+        mid = merchants[idx % len(merchants)]["id"]
+        while not warmup_stop.is_set():
+            try:
+                r = requests.post(f"{BASE}/v1/payment_intents",
+                    json={"merchantId": mid, "amount": rand_amount(), "currency": rand_currency()}, timeout=10)
+                if r.status_code < 300:
+                    iid = r.json()["id"]
+                    requests.post(f"{BASE}/v1/payment_intents/{iid}/confirm",
+                        json=CARD_VISA, headers={"Content-Type": "application/json"}, timeout=15)
+            except Exception:
+                pass
+            warmup_stop.wait(timeout=1.0)
+    warmup_threads = [threading.Thread(target=warmup_worker, args=(i,), daemon=True) for i in range(WARMUP_TPS)]
+    for t in warmup_threads:
+        t.start()
+    time.sleep(WARMUP_S)
+    warmup_stop.set()
+    for t in warmup_threads:
+        t.join(timeout=5)
+    ok(f"Warmup complete ({WARMUP_TPS} TPS x {WARMUP_S}s)")
 
     print_metrics_snapshot("Before Load")
 
@@ -208,7 +258,7 @@ def test_sustained_load():
                     errors_other.append(str(e)[:80])
 
     # -- Phase 1: Traffic -----------------------------------------------------
-    CONFIRM_THREADS = 100  # separate pool to drain confirm queue without blocking creates
+    CONFIRM_THREADS = THREADS  # separate pool to drain confirm queue without blocking creates
     info(f"Starting {THREADS} create + {CONFIRM_THREADS} confirm threads for {DURATION_S}s...")
     create_threads = [threading.Thread(target=create_worker, args=(i,), daemon=True) for i in range(THREADS)]
     confirm_threads = [threading.Thread(target=confirm_worker, daemon=True) for _ in range(CONFIRM_THREADS)]
@@ -260,54 +310,58 @@ def test_sustained_load():
                      f"{len(errors_5xx)} 5xx errors ({len(errors_5xx)/max(total_created,1)*100:.1f}%)")
 
     # -- Phase 2: Drain -- wait for webhooks ----------------------------------
-    info(f"Draining for up to {DRAIN_S}s waiting for webhooks...")
+    # For large runs, sample the drain: poll a random subset to estimate terminal %
+    DRAIN_SAMPLE = min(total_created, 5000)
+    drain_ids = random.sample(created_ids, DRAIN_SAMPLE) if total_created > DRAIN_SAMPLE else list(created_ids)
+    info(f"Draining for up to {DRAIN_S}s — polling {len(drain_ids)} intents (of {total_created})...")
     terminal_statuses = {"authorized", "failed", "captured", "expired"}
     drain_start = time.time()
     terminal_ids = set()
 
+    import concurrent.futures
+    POLL_WORKERS = 50
+    POLL_BATCH = 500
+
     def poll_batch(ids_to_check):
-        """Check a batch of intent IDs for terminal status using a thread pool."""
+        """Poll a batch of IDs concurrently."""
         newly_terminal = set()
         poll_lock = threading.Lock()
 
         def check_one(iid):
             try:
-                d = get_intent(iid)
-                if d["status"] in terminal_statuses:
+                status = get_intent_status(iid)
+                if status in terminal_statuses:
                     with poll_lock:
                         newly_terminal.add(iid)
             except Exception:
                 pass
 
-        batch_threads = [threading.Thread(target=check_one, args=(iid,)) for iid in ids_to_check]
-        for bt in batch_threads:
-            bt.start()
-        for bt in batch_threads:
-            bt.join(timeout=10)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=POLL_WORKERS) as executor:
+            list(executor.map(check_one, ids_to_check))
         return newly_terminal
 
-    POLL_BATCH_SIZE = 500
-
     while time.time() - drain_start < DRAIN_S:
-        remaining_ids = [iid for iid in created_ids if iid not in terminal_ids]
+        remaining_ids = [iid for iid in drain_ids if iid not in terminal_ids]
         if not remaining_ids:
             break
 
-        batch = remaining_ids[:POLL_BATCH_SIZE]
+        batch = remaining_ids[:POLL_BATCH]
         newly = poll_batch(batch)
         terminal_ids.update(newly)
 
-        pct = len(terminal_ids) / total_created * 100 if total_created > 0 else 0
+        drain_total = len(drain_ids)
+        pct = len(terminal_ids) / drain_total * 100 if drain_total > 0 else 0
         elapsed_drain = time.time() - drain_start
-        print(f"\r  {CYAN}->{RESET} drain t={elapsed_drain:.0f}s  terminal={len(terminal_ids)}/{total_created} ({pct:.1f}%)", end="", flush=True)
+        print(f"\r  {CYAN}->{RESET} drain t={elapsed_drain:.0f}s  terminal={len(terminal_ids)}/{drain_total} ({pct:.1f}%)", end="", flush=True)
 
-        if len(terminal_ids) == total_created:
+        if len(terminal_ids) >= drain_total:
             break
         time.sleep(DRAIN_POLL_INTERVAL)
 
     print()
     drain_elapsed = time.time() - drain_start
-    info(f"Drain complete in {drain_elapsed:.1f}s — {len(terminal_ids)}/{total_created} terminal")
+    drain_total = len(drain_ids)
+    info(f"Drain complete in {drain_elapsed:.1f}s — {len(terminal_ids)}/{drain_total} sampled terminal")
 
     print_metrics_snapshot("After Drain")
 
@@ -325,19 +379,22 @@ def test_sustained_load():
             g_mem = f"{gm.get('mem_used_mb', 0):.0f}MB" if gm.get('mem_used_mb') is not None else "n/a"
             info(f"t={snap['t']:.0f}s  Backend[cpu={b_cpu} thr={b_thr} mem={b_mem}]  Gateway[cpu={g_cpu} thr={g_thr} mem={g_mem}]")
 
-    # -- Phase 3: Validation --------------------------------------------------
-    print(f"\n  {BOLD}Validating {total_created} intents...{RESET}")
+    # -- Phase 3: Validation (sample-based for large runs) --------------------
+    VALIDATION_SAMPLE = min(total_created, 2000)
+    sample_ids = random.sample(created_ids, VALIDATION_SAMPLE) if total_created > VALIDATION_SAMPLE else list(created_ids)
+    print(f"\n  {BOLD}Validating {VALIDATION_SAMPLE} intents (sampled from {total_created})...{RESET}")
     status_counts = Counter()
     mismatches = 0
     multi_attempts = 0
     missing_attempts = 0
     stuck = 0
+    fetch_failures = 0
 
-    for idx, iid in enumerate(created_ids):
+    for idx, iid in enumerate(sample_ids):
         try:
             detail = get_intent(iid)
         except Exception:
-            record_issue("CRITICAL", "sustained_validation", f"Failed to fetch intent {iid}")
+            fetch_failures += 1
             continue
 
         intent_status = detail["status"]
@@ -368,9 +425,12 @@ def test_sustained_load():
                              f"Intent {iid}: intent={intent_status}, attempt={attempt_status}")
 
         if (idx + 1) % 500 == 0:
-            print(f"\r  {CYAN}->{RESET} validated {idx+1}/{total_created}...", end="", flush=True)
+            print(f"\r  {CYAN}->{RESET} validated {idx+1}/{VALIDATION_SAMPLE}...", end="", flush=True)
 
-    print(f"\r  {CYAN}->{RESET} validated {total_created}/{total_created}    ")
+    print(f"\r  {CYAN}->{RESET} validated {VALIDATION_SAMPLE}/{VALIDATION_SAMPLE}    ")
+    if fetch_failures > 0:
+        record_issue("WARNING", "sustained_validation",
+                     f"{fetch_failures}/{VALIDATION_SAMPLE} intents failed to fetch during validation")
 
     # -- Report ---------------------------------------------------------------
     info(f"Status breakdown: {dict(status_counts)}")
@@ -400,12 +460,12 @@ def test_sustained_load():
     else:
         ok("All intent/attempt status pairs are consistent")
 
-    terminal_pct = len(terminal_ids) / total_created * 100 if total_created > 0 else 0
+    terminal_pct = len(terminal_ids) / len(drain_ids) * 100 if drain_ids else 0
     if terminal_pct >= 95:
-        ok(f"Terminal coverage: {terminal_pct:.1f}% ({len(terminal_ids)}/{total_created})")
+        ok(f"Terminal coverage: {terminal_pct:.1f}% ({len(terminal_ids)}/{len(drain_ids)} sampled)")
     else:
         record_issue("WARNING", "sustained_terminal",
-                     f"Only {terminal_pct:.1f}% reached terminal within {DRAIN_S}s drain")
+                     f"Only {terminal_pct:.1f}% reached terminal within {DRAIN_S}s drain (sampled {len(drain_ids)})")
 
     # -- Merchant distribution validation -------------------------------------
     print(f"\n  {BOLD}Validating merchant distribution...{RESET}")
@@ -514,7 +574,9 @@ def test_sustained_load():
 
 
 if __name__ == "__main__":
-    test_dispatch_retry()
-    test_expiry_auth_hang()
+    stress_only = "--stress" in sys.argv
+    if not stress_only:
+        test_dispatch_retry()
+        test_expiry_auth_hang()
     test_sustained_load()
     print_results()

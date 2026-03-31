@@ -177,6 +177,13 @@ def get_intent(intent_id) -> dict:
     return r.json()
 
 
+def get_intent_status(intent_id) -> str:
+    """Lightweight status check — single DB read, no auth-service RPC."""
+    r = requests.get(f"{BASE}/v1/payment_intents/{intent_id}/summary", timeout=5)
+    r.raise_for_status()
+    return r.json()["status"]
+
+
 def wait_for_terminal(intent_id, timeout_s=180) -> str:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
