@@ -25,3 +25,6 @@ Thumbs.db
 pgdata/
 *.db
 frontend/.vite/
+
+# Secrets
+infra/secrets/
