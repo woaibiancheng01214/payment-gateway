@@ -171,7 +171,7 @@ def test_business_metrics():
     # It may also append _total, _seconds, _bucket, etc.
     expected_metrics = [
         "payment_intents_created",
-        "payment_intents_confirm_duration",
+        "payment_intents_authorise_duration",
         "payment_intents_capture_requested",
         "payment_webhooks_processed",
         "payment_intents_status_changes",

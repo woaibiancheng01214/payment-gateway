@@ -20,7 +20,7 @@ class AuthService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    fun confirm(request: ConfirmRequest): ConfirmResponse {
+    fun authorise(request: AuthoriseRequest): AuthoriseResponse {
         val pmAuth = tokenClient.getPaymentMethodForAuth(request.paymentMethodId)
         // Verify card data is accessible (validates the card_data_id is real)
         vaultClient.getCardData(pmAuth.cardDataId)
@@ -39,8 +39,24 @@ class AuthService(
         )
         internalAttemptRepository.save(internalAttempt)
 
-        dispatchBestEffort(internalAttempt)
-        return ConfirmResponse(internalAttemptId = internalAttempt.id)
+        // Synchronous auth — gateway returns result inline
+        val status = try {
+            val result = gatewayClient.dispatchAuth(internalAttempt)
+            markDispatched(internalAttempt.id)
+            val resolvedStatus = when (result) {
+                "success" -> InternalAttemptStatus.SUCCESS
+                else -> InternalAttemptStatus.FAILURE
+            }
+            internalAttempt.status = resolvedStatus
+            internalAttempt.responsePayload = truncatePayload(objectMapper.writeValueAsString(mapOf("status" to result)))
+            internalAttempt.updatedAt = Instant.now()
+            internalAttemptRepository.save(internalAttempt)
+            result
+        } catch (e: Exception) {
+            log.warn("Auth dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
+            "pending"
+        }
+        return AuthoriseResponse(internalAttemptId = internalAttempt.id, status = status)
     }
 
     fun capture(request: CaptureRequest): CaptureResponse {
@@ -67,7 +83,7 @@ class AuthService(
         )
         internalAttemptRepository.save(internalAttempt)
 
-        dispatchBestEffort(internalAttempt)
+        dispatchCaptureAsync(internalAttempt)
         return CaptureResponse(internalAttemptId = internalAttempt.id)
     }
 
@@ -140,12 +156,12 @@ class AuthService(
         internalAttemptRepository.save(attempt)
     }
 
-    private fun dispatchBestEffort(internalAttempt: InternalAttempt) {
+    private fun dispatchCaptureAsync(internalAttempt: InternalAttempt) {
         try {
-            gatewayClient.dispatch(internalAttempt)
+            gatewayClient.dispatchCapture(internalAttempt)
             markDispatched(internalAttempt.id)
         } catch (e: Exception) {
-            log.warn("Dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
+            log.warn("Capture dispatch failed for ${internalAttempt.id} — scheduler will retry: ${e.message}")
         }
     }
 

@@ -25,12 +25,12 @@ class PaymentIntentController(
         return ResponseEntity.status(HttpStatus.CREATED).body(response)
     }
 
-    @PostMapping("/{id}/confirm")
-    fun confirm(
+    @PostMapping("/{id}/authorise")
+    fun authorise(
         @PathVariable id: String,
         @Valid @RequestBody request: ConfirmPaymentIntentRequest
     ): ResponseEntity<PaymentIntentResponse> {
-        val response = paymentIntentService.confirmPaymentIntent(id, request)
+        val response = paymentIntentService.authorisePaymentIntent(id, request)
         return ResponseEntity.ok(response)
     }
 

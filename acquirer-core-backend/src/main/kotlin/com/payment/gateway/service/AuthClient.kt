@@ -48,8 +48,8 @@ class AuthClient(
             .build()
     )
 
-    data class ConfirmRequest(val paymentIntentId: String, val paymentMethodId: String, val paymentAttemptId: String, val amount: Long, val currency: String)
-    data class ConfirmResponse(val internalAttemptId: String)
+    data class AuthoriseRequest(val paymentIntentId: String, val paymentMethodId: String, val paymentAttemptId: String, val amount: Long, val currency: String)
+    data class AuthoriseResponse(val internalAttemptId: String, val status: String = "pending")
     data class CaptureRequest(val paymentAttemptId: String, val amount: Long, val currency: String)
     data class CaptureResponse(val internalAttemptId: String)
     data class WebhookProcessRequest(val internalAttemptId: String, val status: String)
@@ -68,12 +68,12 @@ class AuthClient(
         }.get()
     }
 
-    fun confirm(paymentIntentId: String, paymentMethodId: String, paymentAttemptId: String, amount: Long, currency: String): ConfirmResponse {
+    fun authorise(paymentIntentId: String, paymentMethodId: String, paymentAttemptId: String, amount: Long, currency: String): AuthoriseResponse {
         return withResilience {
             val response = http.postForEntity(
-                "$authServiceUrl/internal/auth/confirm",
-                ConfirmRequest(paymentIntentId, paymentMethodId, paymentAttemptId, amount, currency),
-                ConfirmResponse::class.java
+                "$authServiceUrl/internal/auth/authorise",
+                AuthoriseRequest(paymentIntentId, paymentMethodId, paymentAttemptId, amount, currency),
+                AuthoriseResponse::class.java
             )
             response.body ?: throw IllegalStateException("Empty response from auth-service")
         }

@@ -15,6 +15,7 @@ class ConfirmDispatchScheduler(
     private val paymentAttemptRepository: PaymentAttemptRepository,
     private val paymentIntentRepository: PaymentIntentRepository,
     private val authClient: AuthClient,
+    private val paymentIntentService: PaymentIntentService,
     private val transactionTemplate: TransactionTemplate,
 
     @Value("\${payment.dispatch.stale-seconds:10}")
@@ -27,29 +28,32 @@ class ConfirmDispatchScheduler(
 
     @Scheduled(fixedDelayString = "\${payment.dispatch.retry-interval-seconds:3}000")
     @SchedulerLock(name = "sweepUndispatchedConfirms", lockAtMostFor = "9s", lockAtLeastFor = "2s")
-    fun sweepUndispatchedConfirms() {
+    fun sweepUndispatchedAuthorisations() {
         val staleThreshold = Instant.now().minusSeconds(dispatchStaleSeconds)
         val undispatched = paymentAttemptRepository.findUndispatched(staleThreshold, batchSize)
         if (undispatched.isEmpty()) return
 
-        log.info("Confirm dispatch-retry: found ${undispatched.size} undispatched attempt(s)")
+        log.info("Authorise dispatch-retry: found ${undispatched.size} undispatched attempt(s)")
         var dispatched = 0
         for (attempt in undispatched) {
             try {
                 val intent = paymentIntentRepository.findById(attempt.paymentIntentId).orElse(null)
                     ?: continue
-                authClient.confirm(
+                val result = authClient.authorise(
                     intent.id, attempt.paymentMethodId, attempt.id,
                     intent.amount, intent.currency.name
                 )
                 transactionTemplate.execute {
                     paymentAttemptRepository.markDispatched(attempt.id, Instant.now())
                 }
+                if (result.status in listOf("success", "failure")) {
+                    paymentIntentService.applyAuthResult(intent.id, attempt.id, result.status)
+                }
                 dispatched++
             } catch (e: Exception) {
-                log.error("Confirm dispatch-retry failed for ${attempt.id}: ${e.message}")
+                log.error("Authorise dispatch-retry failed for ${attempt.id}: ${e.message}")
             }
         }
-        if (dispatched > 0) log.info("Confirm dispatch-retry: dispatched $dispatched attempt(s)")
+        if (dispatched > 0) log.info("Authorise dispatch-retry: dispatched $dispatched attempt(s)")
     }
 }

@@ -21,6 +21,11 @@ data class GatewayAckResponse(
     val status: String = "pending"
 )
 
+data class AuthorizeResponse(
+    val gatewayRef: String,
+    val status: String   // "success" or "failure"
+)
+
 data class WebhookPayload(
     val internalAttemptId: String,
     val status: String

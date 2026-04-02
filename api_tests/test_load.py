@@ -2,9 +2,10 @@
 Sustained load test, expiry test, and dispatch retry test.
 
 Usage:
-    python -m api_tests.test_load                  # default 30s
-    python -m api_tests.test_load --duration 1200   # 20 minutes
-    LOAD_DURATION=600 python -m api_tests.test_load # 10 minutes via env var
+    python -m api_tests.test_load                      # default 30s, 100 write TPS, 200 read TPS
+    python -m api_tests.test_load --duration 1200       # 20 minutes
+    python -m api_tests.test_load --read-tps 500        # 500 reads/sec
+    LOAD_READ_TPS=0 python -m api_tests.test_load       # disable read traffic
 """
 
 import os
@@ -12,9 +13,13 @@ import sys
 import threading
 import queue
 import time
+import math
+import asyncio
 import requests
 import random
 from collections import Counter
+
+import aiohttp
 
 from api_tests.conftest import *
 
@@ -33,6 +38,28 @@ def _parse_tps() -> int:
         if arg == "--tps" and i + 1 < len(sys.argv):
             return int(sys.argv[i + 1])
     return int(os.environ.get("LOAD_TPS", "100"))
+
+
+def _parse_read_tps() -> int:
+    """Parse read TPS from --read-tps CLI arg or LOAD_READ_TPS env var. Default 200."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--read-tps" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+    return int(os.environ.get("LOAD_READ_TPS", "200"))
+
+
+# -- Read type weights for mixed read traffic --------------------------------
+READ_WEIGHTS = [
+    ("get_detail",      40),   # GET /v1/payment_intents/{id}
+    ("get_summary",     25),   # GET /v1/payment_intents/{id}/summary
+    ("list_cursor",     10),   # GET /v1/payment_intents/cursor?limit=N
+    ("list_merchant",   10),   # GET /v1/payment_intents/cursor/merchant/{mid}?limit=N
+    ("get_merchant",     8),   # GET /v1/merchants/{id}
+    ("ledger_entries",   5),   # GET /v1/ledger/entries?paymentIntentId={id}
+    ("ledger_balances",  2),   # GET /v1/ledger/balances
+]
+READ_TYPE_NAMES = [w[0] for w in READ_WEIGHTS]
+READ_TYPE_WEIGHTS = [w[1] for w in READ_WEIGHTS]
 
 
 def test_outbox_dispatch_flag():
@@ -203,19 +230,20 @@ def test_expiry_auth_hang():
 
 def test_sustained_load():
     """
-    Sustained 100 TPS of create+confirm, then drain waiting for webhooks.
-    Duration is configurable via --duration CLI arg or LOAD_DURATION env var.
+    Sustained write+read TPS, then drain waiting for webhooks.
+    Configurable via --duration, --tps, --read-tps CLI args or env vars.
     Drain time scales with duration (minimum 120s).
     """
     THREADS = _parse_tps()
     DURATION_S = _parse_duration()
+    READ_TPS = _parse_read_tps()
     # Drain needs enough time to poll all intents: ~TPS * DURATION / batch_size * seconds_per_batch
     estimated_intents = THREADS * DURATION_S
     DRAIN_S = max(120, estimated_intents // 500 + 120)  # generous drain budget
     DRAIN_POLL_INTERVAL = 1
 
     print(f"\n{BOLD}{'='*60}{RESET}")
-    print(f"{BOLD}   Sustained Load Test — {THREADS} TPS x {DURATION_S}s{RESET}")
+    print(f"{BOLD}   Sustained Load Test — {THREADS} write TPS + {READ_TPS} read TPS x {DURATION_S}s{RESET}")
     print(f"{BOLD}{'='*60}{RESET}")
 
     # -- Pre-traffic: Create one merchant per worker --------------------------
@@ -241,7 +269,7 @@ def test_sustained_load():
                     json={"merchantId": mid, "amount": rand_amount(), "currency": rand_currency()}, timeout=10)
                 if r.status_code < 300:
                     iid = r.json()["id"]
-                    requests.post(f"{BASE}/v1/payment_intents/{iid}/confirm",
+                    requests.post(f"{BASE}/v1/payment_intents/{iid}/authorise",
                         json=CARD_VISA, headers={"Content-Type": "application/json"}, timeout=15)
             except Exception:
                 pass
@@ -260,14 +288,20 @@ def test_sustained_load():
     created_ids = []
     created_merchant_map = {}  # intent_id -> merchant_id
     create_latencies = []
-    confirm_latencies = []
+    authorise_latencies = []
     errors_5xx = []
     errors_other = []
     stop_event = threading.Event()
     ids_lock = threading.Lock()
     metrics_snapshots = []
 
-    confirm_queue = queue.Queue()
+    # -- Read traffic state ---------------------------------------------------
+    read_latencies = {name: [] for name in READ_TYPE_NAMES}
+    read_errors_5xx = []
+    read_errors_other = []
+    read_count = [0]  # mutable counter (list so inner fn can mutate)
+
+    authorise_queue = queue.Queue()
 
     def create_worker(worker_index):
         """Each worker loops: create -> enqueue confirm -> pace to 1 TPS."""
@@ -288,7 +322,7 @@ def test_sustained_load():
                         create_latencies.append(create_ms)
                         created_ids.append(iid)
                         created_merchant_map[iid] = merchant_id
-                    confirm_queue.put(iid)
+                    authorise_queue.put(iid)
 
             except requests.exceptions.RequestException as e:
                 with ids_lock:
@@ -299,37 +333,140 @@ def test_sustained_load():
             if not stop_event.is_set():
                 stop_event.wait(timeout=sleep_for)
 
-    def confirm_worker():
+    def authorise_worker():
         """Drains the confirm queue independently so creates are not blocked."""
-        while not stop_event.is_set() or not confirm_queue.empty():
+        while not stop_event.is_set() or not authorise_queue.empty():
             try:
-                iid = confirm_queue.get(timeout=1)
+                iid = authorise_queue.get(timeout=1)
             except queue.Empty:
                 continue
             try:
                 t1 = time.time()
-                r2 = requests.post(f"{BASE}/v1/payment_intents/{iid}/confirm",
+                r2 = requests.post(f"{BASE}/v1/payment_intents/{iid}/authorise",
                                    json=CARD_VISA,
                                    headers={"Content-Type": "application/json"},
                                    timeout=10)
-                confirm_ms = (time.time() - t1) * 1000
+                authorise_ms = (time.time() - t1) * 1000
                 if r2.status_code >= 500:
                     with ids_lock:
                         errors_5xx.append(("confirm", r2.status_code))
                 else:
                     with ids_lock:
-                        confirm_latencies.append(confirm_ms)
+                        authorise_latencies.append(authorise_ms)
             except requests.exceptions.RequestException as e:
                 with ids_lock:
                     errors_other.append(str(e)[:80])
 
+    async def _async_read_loop(target_tps, duration_s):
+        """Async read loop: fires target_tps reads/sec using non-blocking aiohttp."""
+        interval = 1.0 / target_tps if target_tps > 0 else 1.0
+        timeout = aiohttp.ClientTimeout(total=5)
+        connector = aiohttp.TCPConnector(limit=min(target_tps, 200))
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+
+            async def do_one_read():
+                with ids_lock:
+                    if not created_ids:
+                        return
+                    intent_id = random.choice(created_ids)
+                    merchant_id = created_merchant_map.get(intent_id, merchants[0]["id"])
+
+                read_type = random.choices(READ_TYPE_NAMES, weights=READ_TYPE_WEIGHTS, k=1)[0]
+                try:
+                    t0 = time.time()
+                    if read_type == "get_detail":
+                        url = f"{BASE}/v1/payment_intents/{intent_id}"
+                        async with session.get(url) as r:
+                            status = r.status
+                    elif read_type == "get_summary":
+                        url = f"{BASE}/v1/payment_intents/{intent_id}/summary"
+                        async with session.get(url) as r:
+                            status = r.status
+                    elif read_type == "list_cursor":
+                        limit = random.choice([5, 10, 20])
+                        url = f"{BASE}/v1/payment_intents/cursor"
+                        async with session.get(url, params={"limit": limit}) as r:
+                            status = r.status
+                    elif read_type == "list_merchant":
+                        limit = random.choice([5, 10, 20])
+                        url = f"{BASE}/v1/payment_intents/cursor/merchant/{merchant_id}"
+                        async with session.get(url, params={"limit": limit}) as r:
+                            status = r.status
+                    elif read_type == "get_merchant":
+                        url = f"{MERCHANT_BASE}/v1/merchants/{merchant_id}"
+                        async with session.get(url) as r:
+                            status = r.status
+                    elif read_type == "ledger_entries":
+                        url = f"{LEDGER_BASE}/v1/ledger/entries"
+                        async with session.get(url, params={"paymentIntentId": intent_id}) as r:
+                            status = r.status
+                    elif read_type == "ledger_balances":
+                        url = f"{LEDGER_BASE}/v1/ledger/balances"
+                        async with session.get(url) as r:
+                            status = r.status
+
+                    elapsed_ms = (time.time() - t0) * 1000
+                    if status >= 500:
+                        with ids_lock:
+                            read_errors_5xx.append((read_type, status))
+                    else:
+                        with ids_lock:
+                            read_latencies[read_type].append(elapsed_ms)
+                            read_count[0] += 1
+
+                except Exception as e:
+                    with ids_lock:
+                        read_errors_other.append((read_type, str(e)[:80]))
+
+            pending_tasks = set()
+            start = time.time()
+            fired = 0
+            while not stop_event.is_set():
+                # Wait for write workers to create some data
+                with ids_lock:
+                    has_data = bool(created_ids)
+                if not has_data:
+                    await asyncio.sleep(0.2)
+                    continue
+
+                # Fire one read and track the task
+                task = asyncio.create_task(do_one_read())
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
+                fired += 1
+                # Pace: sleep until the next scheduled fire time
+                next_fire = start + fired * interval
+                delay = next_fire - time.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+            # Cancel in-flight requests on shutdown
+            for t in pending_tasks:
+                t.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    def _run_async_reads(target_tps, duration_s):
+        """Run the async read loop in a dedicated event loop (called from a thread)."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_async_read_loop(target_tps, duration_s))
+        loop.close()
+
     # -- Phase 1: Traffic -----------------------------------------------------
-    CONFIRM_THREADS = THREADS  # separate pool to drain confirm queue without blocking creates
-    info(f"Starting {THREADS} create + {CONFIRM_THREADS} confirm threads for {DURATION_S}s...")
+    AUTHORISE_THREADS = THREADS  # separate pool to drain confirm queue without blocking creates
+    read_label = f" + {READ_TPS} read (async)" if READ_TPS > 0 else ""
+    info(f"Starting {THREADS} create + {AUTHORISE_THREADS} confirm{read_label} for {DURATION_S}s...")
     create_threads = [threading.Thread(target=create_worker, args=(i,), daemon=True) for i in range(THREADS)]
-    confirm_threads = [threading.Thread(target=confirm_worker, daemon=True) for _ in range(CONFIRM_THREADS)]
+    authorise_threads = [threading.Thread(target=authorise_worker, daemon=True) for _ in range(AUTHORISE_THREADS)]
+    read_thread = None
+    if READ_TPS > 0:
+        read_thread = threading.Thread(target=_run_async_reads, args=(READ_TPS, DURATION_S), daemon=True)
     t_start = time.time()
-    for t in create_threads + confirm_threads:
+    all_threads = create_threads + authorise_threads
+    if read_thread:
+        all_threads.append(read_thread)
+    for t in all_threads:
         t.start()
 
     last_metrics_t = time.time()
@@ -338,8 +475,13 @@ def test_sustained_load():
         elapsed = time.time() - t_start
         with ids_lock:
             n = len(created_ids)
+            n_reads = read_count[0]
+            n_read_5xx = len(read_errors_5xx)
         tps = n / elapsed if elapsed > 0 else 0
-        print(f"\r  {CYAN}->{RESET} t={elapsed:.0f}s  created={n}  TPS={tps:.1f}  5xx={len(errors_5xx)}", end="", flush=True)
+        r_tps = n_reads / elapsed if elapsed > 0 else 0
+        r_label = f"  reads={n_reads}  rTPS={r_tps:.1f}" if READ_TPS > 0 else ""
+        r_5xx = f"+{n_read_5xx}r" if READ_TPS > 0 else ""
+        print(f"\r  {CYAN}->{RESET} t={elapsed:.0f}s  created={n}  wTPS={tps:.1f}{r_label}  5xx={len(errors_5xx)}{r_5xx}", end="", flush=True)
 
         if time.time() - last_metrics_t >= 10:
             backend_m = fetch_server_metrics(BASE, "backend")
@@ -352,21 +494,38 @@ def test_sustained_load():
     stop_event.set()
     for t in create_threads:
         t.join(timeout=15)
-    for t in confirm_threads:
+    for t in authorise_threads:
         t.join(timeout=15)
+    if read_thread:
+        read_thread.join(timeout=15)
     print()
 
     traffic_elapsed = time.time() - t_start
     total_created = len(created_ids)
+    total_reads = read_count[0]
     actual_tps = total_created / traffic_elapsed if traffic_elapsed > 0 else 0
-    info(f"Traffic phase done: {total_created} intents in {traffic_elapsed:.1f}s ({actual_tps:.1f} TPS)")
-    info(f"5xx errors: {len(errors_5xx)}, connection errors: {len(errors_other)}")
+    actual_read_tps = total_reads / traffic_elapsed if traffic_elapsed > 0 else 0
+    info(f"Traffic phase done: {total_created} writes in {traffic_elapsed:.1f}s ({actual_tps:.1f} write TPS)")
+    if READ_TPS > 0:
+        info(f"Read traffic: {total_reads} reads in {traffic_elapsed:.1f}s ({actual_read_tps:.1f} read TPS)")
+    info(f"Write 5xx: {len(errors_5xx)}, Read 5xx: {len(read_errors_5xx)}, connection errors: {len(errors_other) + len(read_errors_other)}")
 
     print_metrics_snapshot("After Traffic (before drain)")
 
     # -- Latency stats --------------------------------------------------------
     percentiles(create_latencies, "Create latency")
-    percentiles(confirm_latencies, "Confirm latency")
+    percentiles(authorise_latencies, "Authorise latency")
+
+    if READ_TPS > 0 and total_reads > 0:
+        print(f"\n  {BOLD}── Read Latencies ──{RESET}")
+        all_read_lats = []
+        for rtype in READ_TYPE_NAMES:
+            lats = read_latencies[rtype]
+            if lats:
+                percentiles(lats, f"  {rtype}")
+                all_read_lats.extend(lats)
+        if all_read_lats:
+            percentiles(all_read_lats, "All reads (combined)")
 
     if len(errors_5xx) > total_created * 0.05:
         record_issue("CRITICAL", "sustained_load",
@@ -374,6 +533,16 @@ def test_sustained_load():
     elif errors_5xx:
         record_issue("WARNING", "sustained_load",
                      f"{len(errors_5xx)} 5xx errors ({len(errors_5xx)/max(total_created,1)*100:.1f}%)")
+
+    if READ_TPS > 0:
+        total_read_attempts = total_reads + len(read_errors_5xx) + len(read_errors_other)
+        if len(read_errors_5xx) > total_read_attempts * 0.05:
+            record_issue("CRITICAL", "sustained_load_reads",
+                         f"Read 5xx error rate {len(read_errors_5xx)}/{total_read_attempts} = "
+                         f"{len(read_errors_5xx)/max(total_read_attempts,1)*100:.1f}%")
+        elif read_errors_5xx:
+            record_issue("WARNING", "sustained_load_reads",
+                         f"{len(read_errors_5xx)} read 5xx errors ({len(read_errors_5xx)/max(total_read_attempts,1)*100:.1f}%)")
 
     # -- Phase 2: Drain -- wait for webhooks ----------------------------------
     # For large runs, sample the drain: poll a random subset to estimate terminal %

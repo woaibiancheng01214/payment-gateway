@@ -1553,3 +1553,119 @@ query.
 **Takeaway:** Any event-driven system with a dead letter queue needs auto-retry with
 backoff. Manual retry APIs are for exceptional cases, not for transient failures. The
 backoff curve should match the expected recovery time of the most common failure modes.
+
+---
+
+## 56. Read traffic under load reveals different bottlenecks than write-only tests
+
+Write-only load tests (create + confirm) showed the system was stable at 100 TPS. Adding
+concurrent read traffic exposed that `GET /v1/payment_intents/{id}` (detail endpoint) had
+P50=500ms — 100x slower than other read endpoints (P50=5ms).
+
+**Root cause:** The detail endpoint makes a synchronous cross-service RPC to card-auth-service
+(`POST /internal/auth/attempts/batch`) to fetch InternalAttempts. This round-trip through
+Docker networking + JSON serialization of large TEXT payload fields (`requestPayload`,
+`responsePayload`) dominated the latency. The `/summary` endpoint, which skips the RPC,
+was fast.
+
+**Read type distribution matters.** We weighted reads to match realistic patterns: 40%
+detail, 25% summary, 20% list/pagination, 8% merchant lookup, 7% ledger queries. This
+revealed that the detail endpoint's cross-service RPC was the bottleneck — something a
+uniform read test would have masked.
+
+**Takeaway:** Always test reads alongside writes. The read path often has different
+bottlenecks (cross-service RPCs, JOINs, serialization) that only surface under combined load.
+
+## 57. Sync thread-per-request load testing caps throughput at the client, not the server
+
+Initial read load testing used Python `threading` with `requests` — one thread per TPS
+target. At 500 read TPS target, actual throughput capped at ~290 TPS because 40% of reads
+hit the 500ms detail endpoint, blocking the thread. With 50 threads each doing 10 ops/sec,
+a single 500ms call consumed the thread's entire budget.
+
+**Fix:** Replaced with `asyncio` + `aiohttp`. A single event loop fires N requests/sec
+non-blocking — slow responses don't block fast ones. Result: 500 TPS target → 460 actual
+(vs 189 with threads). At 1000 TPS target, achieved 731 actual.
+
+**Takeaway:** For realistic load testing above ~200 TPS, async I/O is essential. Thread-per-
+request models measure client-side contention, not server capacity. `aiohttp` with
+`TCPConnector(limit=N)` + `asyncio.Semaphore` is the pattern.
+
+## 58. Docker VM file descriptor limits kill containers before memory does
+
+Running a 30-minute soak test at 100 write + 500 read TPS crashed the Docker VM. Initial
+diagnosis pointed to OOM (16GB VM), but the actual cause was `ulimit -n 1024` — the default
+file descriptor limit.
+
+With 2 checkout replicas (each: 80 HikariCP connections + 200 Tomcat threads + Redis +
+inter-service HTTP), plus the async test client's 200 concurrent sockets, plus Kafka,
+Debezium, and Prometheus scraping — total open sockets easily exceeded 1024.
+
+The failure mode was insidious: `error: socket: Too many open files` in the SSH daemon meant
+Docker port forwarding died, making all containers appear unreachable from the host while
+they were still running internally.
+
+**Fix:** `sysctl -w fs.file-max=65536` + `/etc/security/limits.conf` in the Colima VM.
+
+**Takeaway:** Always set `ulimit -n` to at least 65536 in Docker VMs. The default 1024 is
+inadequate for any multi-service setup. Check this first when Docker connectivity fails
+mysteriously — it's more common than OOM.
+
+## 59. Two replicas on one machine is slower than one replica
+
+Deploying 2 acquirer-core-backend replicas behind nginx on a single Docker host was
+50% slower than a single instance: write TPS dropped from 97 to 46, read TPS from 460 to
+256. Create P50 went from 88ms to 746ms.
+
+**Why:** Both JVMs share the same CPU cores and memory bus. Doubled HikariCP connections
+(160 total) competed for the same PostgreSQL `max_connections=200`. JIT compilation happened
+twice. Context switching overhead increased. The nginx proxy added a hop to every request.
+
+The architecture is correct for horizontal scaling (ShedLock, Redis distributed locks,
+stateless services) but scaling replicas only helps with additional physical resources.
+
+**Takeaway:** Don't test horizontal scaling on a single machine. It proves the architecture
+supports replicas (no shared state, correct locking) but the throughput numbers will be
+misleading. Use separate hosts/pods or dedicated CPU/memory allocations.
+
+## 60. Mock gateway with async webhooks creates artificial throughput ceilings
+
+The mock gateway simulated both auth and capture as async-with-webhook: accept request,
+schedule delayed outcome (10-120s), fire webhook back. At 150+ TPS, the webhook backlog
+overwhelmed the gateway's thread pool — only 30% of intents reached terminal state.
+
+**The webhook round-trip was the bottleneck, not the business logic.** This didn't match
+real-world payment flows where auth is synchronous (gateway returns approve/decline inline)
+and capture is fire-and-forget (settlement is batched).
+
+**Fix:** Made auth synchronous — gateway returns `{status: "success"}` inline with 50-300ms
+simulated latency. Made capture fire-and-forget — client gets `CAPTURED` immediately,
+settlement dispatch happens async. Renamed `confirm` → `authorise` to match payment
+terminology.
+
+**Result:** Write throughput doubled from 100 TPS to 200 TPS. Gateway CPU dropped from 51%
+to 5%. The bottleneck shifted from "webhook round-trip" to "backend CPU" — the correct
+scaling target.
+
+**Takeaway:** Mock services should simulate real-world behavior, not just "something async."
+Sync vs async choices in mock gateways directly affect what bottlenecks you test. If your
+mock is harder than reality, you'll optimise for the wrong thing.
+
+## 61. JVM services on 512MB Docker limits run at 55-65% memory usage regardless of workload
+
+All simple services (merchant-service, card-vault, token-service) showed 55-65% memory
+usage despite being lightweight CRUD services. Merchant-service at 80% triggered
+investigation.
+
+**Root cause:** Not the application — it's the JVM's fixed overhead. With a 512MB Docker
+limit, the JVM auto-sizes max heap to ~124MB (1/4 of available), but non-heap memory is
+fixed: metaspace ~50-80MB, thread stacks ~100-150MB (200 Tomcat threads × 0.5-1MB), JIT
+code cache ~50-100MB, GC overhead ~50MB. Total baseline: ~280-330MB regardless of
+application logic.
+
+PostgreSQL cache hit ratio was 100% (zero disk reads) — the database was not the issue.
+
+**Takeaway:** JVM services have a ~300MB floor. Don't set Docker limits below 512MB for
+any Spring Boot service. The "80% memory" metric is misleading — the JVM pre-allocates
+structures that appear as usage but aren't growing. Monitor heap used vs heap max separately
+from total container memory.

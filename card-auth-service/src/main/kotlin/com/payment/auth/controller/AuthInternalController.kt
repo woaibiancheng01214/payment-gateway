@@ -12,9 +12,9 @@ import org.springframework.web.bind.annotation.*
 class AuthInternalController(
     private val authService: AuthService
 ) {
-    @PostMapping("/confirm")
-    fun confirm(@Valid @RequestBody request: ConfirmRequest): ResponseEntity<ConfirmResponse> =
-        ResponseEntity.status(HttpStatus.CREATED).body(authService.confirm(request))
+    @PostMapping("/authorise")
+    fun authorise(@Valid @RequestBody request: AuthoriseRequest): ResponseEntity<AuthoriseResponse> =
+        ResponseEntity.status(HttpStatus.CREATED).body(authService.authorise(request))
 
     @PostMapping("/capture")
     fun capture(@Valid @RequestBody request: CaptureRequest): ResponseEntity<CaptureResponse> =

@@ -11,7 +11,8 @@ scrape_configs:
     metrics_path: /actuator/prometheus
     static_configs:
       - targets:
-          - "acquirer-core-backend:8080"
+          - "acquirer-core-1:8080"
+          - "acquirer-core-2:8080"
           - "external-payment-gateway:8081"
           - "ledger-service:8082"
           - "card-vault-service:8086"

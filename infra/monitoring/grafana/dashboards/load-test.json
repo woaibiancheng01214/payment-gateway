@@ -1,0 +1,323 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 2,
+  "links": [],
+  "panels": [
+    {
+      "title": "HTTP Request Rate by Service",
+      "description": "Requests/sec per service instance (all endpoints combined)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(http_server_requests_seconds_count[15s]))",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "HTTP Request Rate by Endpoint (Checkout)",
+      "description": "Requests/sec by URI on checkout service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (uri, method) (rate(http_server_requests_seconds_count{instance=~\"acquirer-core.*\", uri!~\"/actuator.*\"}[15s]))",
+          "legendFormat": "{{method}} {{uri}}"
+        }
+      ]
+    },
+    {
+      "title": "HTTP Avg Latency by Endpoint (Checkout)",
+      "description": "Average latency per endpoint on checkout replicas",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 5 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (uri) (rate(http_server_requests_seconds_sum{instance=~\"acquirer-core.*\", uri!~\"/actuator.*\"}[30s])) / sum by (uri) (rate(http_server_requests_seconds_count{instance=~\"acquirer-core.*\", uri!~\"/actuator.*\"}[30s]))",
+          "legendFormat": "avg {{uri}}"
+        }
+      ]
+    },
+    {
+      "title": "HTTP Max Latency per Replica (Checkout)",
+      "description": "Max observed latency per replica (resets every scrape interval)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 5 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "http_server_requests_seconds_max{instance=~\"acquirer-core.*\", uri!~\"/actuator.*\"}",
+          "legendFormat": "max {{instance}} {{method}} {{uri}}"
+        }
+      ]
+    },
+    {
+      "title": "Payment Intents Created (rate)",
+      "description": "Business metric: payment intents created per second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 15 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(payment_intents_created_total[15s]))",
+          "legendFormat": "creates/sec"
+        }
+      ]
+    },
+    {
+      "title": "Confirm Duration (percentiles)",
+      "description": "Business metric: payment confirm latency P50/P95/P99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 5 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "payment_intents_authorise_duration_seconds{quantile=\"0.5\", instance=~\"acquirer-core.*\"}",
+          "legendFormat": "P50 {{instance}}"
+        },
+        {
+          "expr": "payment_intents_authorise_duration_seconds{quantile=\"0.95\", instance=~\"acquirer-core.*\"}",
+          "legendFormat": "P95 {{instance}}"
+        },
+        {
+          "expr": "payment_intents_authorise_duration_seconds{quantile=\"0.99\", instance=~\"acquirer-core.*\"}",
+          "legendFormat": "P99 {{instance}}"
+        },
+        {
+          "expr": "payment_intents_authorise_duration_seconds_max{instance=~\"acquirer-core.*\"}",
+          "legendFormat": "max {{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Status Changes (rate)",
+      "description": "Payment intent state transitions per second",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (to) (rate(payment_intents_status_changes_total[15s]))",
+          "legendFormat": "-> {{to}}"
+        }
+      ]
+    },
+    {
+      "title": "HTTP 5xx Error Rate",
+      "description": "Server errors per second by service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 15, "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(http_server_requests_seconds_count{status=~\"5..\"}[15s]))",
+          "legendFormat": "5xx {{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "HikariCP Connections",
+      "description": "Active vs max connections per service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "hikaricp_connections_active{instance=~\"acquirer-core.*\"}",
+          "legendFormat": "active {{instance}}"
+        },
+        {
+          "expr": "hikaricp_connections_max{instance=~\"acquirer-core.*\"}",
+          "legendFormat": "max {{instance}}"
+        },
+        {
+          "expr": "hikaricp_connections_pending{instance=~\"acquirer-core.*\"}",
+          "legendFormat": "pending {{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "CPU Usage by Service",
+      "description": "Process CPU usage per JVM instance",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "custom": { "fillOpacity": 10 }, "min": 0, "max": 1 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "process_cpu_usage",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "JVM Heap Used by Service",
+      "description": "Heap memory usage per JVM instance",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (jvm_memory_used_bytes{area=\"heap\"})",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "Tomcat Threads Busy",
+      "description": "Active Tomcat request-processing threads",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "tomcat_threads_busy_threads",
+          "legendFormat": "busy {{instance}}"
+        },
+        {
+          "expr": "tomcat_threads_config_max_threads",
+          "legendFormat": "max {{instance}}"
+        }
+      ]
+    },
+    {
+      "title": "PostgreSQL Active Connections",
+      "description": "Active connections to PostgreSQL by database",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "pg_stat_activity_count{datname=~\"acquirer_core|card_auth|ledger|merchant_service\"}",
+          "legendFormat": "{{datname}} ({{state}})"
+        }
+      ]
+    },
+    {
+      "title": "PostgreSQL Locks by Mode",
+      "description": "Active locks by lock mode",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "pg_locks_count{datname=\"acquirer_core\"}",
+          "legendFormat": "{{mode}}"
+        }
+      ]
+    },
+    {
+      "title": "PostgreSQL Rows Fetched & Modified (rate)",
+      "description": "Row throughput in acquirer_core database",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(pg_stat_database_tup_fetched{datname=\"acquirer_core\"}[15s])",
+          "legendFormat": "fetched"
+        },
+        {
+          "expr": "rate(pg_stat_database_tup_inserted{datname=\"acquirer_core\"}[15s])",
+          "legendFormat": "inserted"
+        },
+        {
+          "expr": "rate(pg_stat_database_tup_updated{datname=\"acquirer_core\"}[15s])",
+          "legendFormat": "updated"
+        }
+      ]
+    },
+    {
+      "title": "Container Memory % of Limit",
+      "description": "Docker container memory usage as % of limit",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "custom": { "fillOpacity": 10 }, "min": 0, "max": 1 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "container_memory_usage_bytes{name=~\"payment-gateway-(acquirer|card-auth|merchant|ledger|external).*\"} / container_spec_memory_limit_bytes{name=~\"payment-gateway-(acquirer|card-auth|merchant|ledger|external).*\"}",
+          "legendFormat": "{{name}}"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["load-test", "payment-gateway"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Payment Gateway — Load Test",
+  "uid": "load-test",
+  "version": 1
+}

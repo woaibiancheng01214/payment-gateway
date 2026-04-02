@@ -102,7 +102,7 @@ class GatewaySimulatorService(
         }
     }
 
-    private fun rollOutcome(type: GatewayJobType): String {
+    fun rollOutcome(type: GatewayJobType): String {
         val roll = (1..100).random()
         return when (type) {
             GatewayJobType.AUTH -> when {

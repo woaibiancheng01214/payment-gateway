@@ -158,13 +158,16 @@ def create_intent(amount=None, currency=None, merchant_id=None) -> dict:
     return r.json()
 
 
-def confirm_intent(intent_id, card_data=None) -> requests.Response:
+def authorise_intent(intent_id, card_data=None) -> requests.Response:
     return requests.post(
-        f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+        f"{BASE}/v1/payment_intents/{intent_id}/authorise",
         json=card_data or CARD_VISA,
         headers={"Content-Type": "application/json"},
         timeout=15,
     )
+
+# Backward compat alias
+confirm_intent = authorise_intent
 
 
 def capture_intent(intent_id) -> requests.Response:

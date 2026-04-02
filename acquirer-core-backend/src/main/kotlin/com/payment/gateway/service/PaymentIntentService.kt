@@ -34,7 +34,7 @@ class PaymentIntentService(
 
     // ── Business metrics ───────────────────────────────────────────────────
     private val createCounter = Counter.builder("payment.intents.created").register(meterRegistry)
-    private val confirmTimer = Timer.builder("payment.intents.confirm.duration")
+    private val authoriseTimer = Timer.builder("payment.intents.authorise.duration")
         .publishPercentiles(0.5, 0.95, 0.99).register(meterRegistry)
     private val captureCounter = Counter.builder("payment.intents.capture.requested").register(meterRegistry)
     private val webhookCounter = Counter.builder("payment.webhooks.processed").register(meterRegistry)
@@ -145,7 +145,7 @@ class PaymentIntentService(
         val alreadyExisted: Boolean
     )
 
-    fun confirmPaymentIntent(
+    fun authorisePaymentIntent(
         intentId: String,
         request: ConfirmPaymentIntentRequest
     ): PaymentIntentResponse {
@@ -183,7 +183,7 @@ class PaymentIntentService(
 
                 val existingAttempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 if (existingAttempt != null) {
-                    log.warn("Duplicate confirm blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
+                    log.warn("Duplicate authorise blocked for intent $intentId (attempt ${existingAttempt.id} already exists)")
                     return@execute ConfirmTxResult(
                         response = intent.toResponse(),
                         attemptId = existingAttempt.id,
@@ -213,11 +213,15 @@ class PaymentIntentService(
                 )
             }!!
 
-            // Dispatch to card-auth-service AFTER transaction commits (connection released)
+            // Synchronous auth — gateway returns result inline
             if (!txResult.alreadyExisted) {
                 try {
-                    authClient.confirm(intentId, txResult.paymentMethodId, txResult.attemptId, txResult.amount, txResult.currency)
+                    val authResult = authClient.authorise(intentId, txResult.paymentMethodId, txResult.attemptId, txResult.amount, txResult.currency)
                     markAttemptDispatched(txResult.attemptId)
+
+                    if (authResult.status in listOf("success", "failure")) {
+                        return applyAuthResult(intentId, txResult.attemptId, authResult.status)
+                    }
                 } catch (e: Exception) {
                     log.warn("Auth-service dispatch failed for intent $intentId — scheduler will retry: ${e.message}")
                 }
@@ -226,8 +230,39 @@ class PaymentIntentService(
             return txResult.response
         } finally {
             lockManager.releaseLock(intentId, lockResult)
-            sample.stop(confirmTimer)
+            sample.stop(authoriseTimer)
         }
+    }
+
+    fun applyAuthResult(intentId: String, attemptId: String, status: String): PaymentIntentResponse {
+        return transactionTemplate.execute {
+            val attempt = paymentAttemptRepository.findById(attemptId).orElseThrow()
+            val intent = paymentIntentRepository.findByIdForUpdate(intentId).orElseThrow()
+
+            if (intent.status != PaymentIntentStatus.REQUIRES_CONFIRMATION) {
+                return@execute intent.toResponse()
+            }
+
+            when (status) {
+                "success" -> {
+                    attempt.status = PaymentAttemptStatus.AUTHORIZED
+                    intent.status = PaymentIntentStatus.AUTHORIZED
+                    statusChangeCounter("requires_confirmation", "authorized").increment()
+                    log.info("PaymentIntent $intentId authorized (sync)")
+                }
+                "failure" -> {
+                    attempt.status = PaymentAttemptStatus.FAILED
+                    intent.status = PaymentIntentStatus.FAILED
+                    statusChangeCounter("requires_confirmation", "failed").increment()
+                    log.info("PaymentIntent $intentId failed (sync)")
+                }
+            }
+            attempt.updatedAt = Instant.now()
+            intent.updatedAt = Instant.now()
+            paymentAttemptRepository.save(attempt)
+            paymentIntentRepository.save(intent)
+            intent.toResponse()
+        }!!
     }
 
     // ── Capture ─────────────────────────────────────────────────────────────
@@ -255,6 +290,16 @@ class PaymentIntentService(
             val attempt = paymentAttemptRepository.findTopByPaymentIntentIdOrderByCreatedAtDesc(intentId)
                 ?: throw IllegalStateException("No PaymentAttempt found for intent $intentId")
 
+            // Fire-and-forget: mark as CAPTURED immediately
+            intent.status = PaymentIntentStatus.CAPTURED
+            intent.updatedAt = Instant.now()
+            attempt.status = PaymentAttemptStatus.CAPTURED
+            attempt.updatedAt = Instant.now()
+            paymentIntentRepository.save(intent)
+            paymentAttemptRepository.save(attempt)
+            statusChangeCounter("authorized", "captured").increment()
+            log.info("PaymentIntent $intentId captured (fire-and-forget)")
+
             CaptureTxResult(
                 response = intent.toResponse(),
                 attemptId = attempt.id,
@@ -263,11 +308,11 @@ class PaymentIntentService(
             )
         }!!
 
-        // Dispatch capture to card-auth-service AFTER transaction commits
+        // Dispatch capture to card-auth-service AFTER transaction commits (for settlement)
         try {
             authClient.capture(txResult.attemptId, txResult.amount, txResult.currency)
         } catch (e: Exception) {
-            log.warn("Auth-service capture dispatch failed for intent $intentId: ${e.message}")
+            log.warn("Auth-service capture dispatch failed for intent $intentId — scheduler will retry: ${e.message}")
         }
 
         return txResult.response
@@ -331,19 +376,11 @@ class PaymentIntentService(
     }
 
     private fun handleCaptureWebhook(attempt: PaymentAttempt, intent: PaymentIntent, resolvedStatus: String) {
+        // Intent is already CAPTURED (fire-and-forget). Webhook is for settlement confirmation only.
         when (resolvedStatus) {
-            "success" -> {
-                attempt.status = PaymentAttemptStatus.CAPTURED
-                intent.status = PaymentIntentStatus.CAPTURED
-                attempt.updatedAt = Instant.now()
-                intent.updatedAt = Instant.now()
-                paymentAttemptRepository.save(attempt)
-                paymentIntentRepository.save(intent)
-                statusChangeCounter("authorized", "captured").increment()
-                log.info("PaymentIntent ${intent.id} captured")
-            }
-            "failure" -> log.warn("Capture failed for PaymentIntent ${intent.id} — still authorized, retry is possible")
-            else -> log.info("Capture webhook with status $resolvedStatus for ${intent.id} — retry pending")
+            "success" -> log.info("Capture settlement confirmed for PaymentIntent ${intent.id}")
+            "failure" -> log.warn("Capture settlement failed for PaymentIntent ${intent.id} — will be retried by scheduler")
+            else -> log.info("Capture webhook with status $resolvedStatus for ${intent.id}")
         }
     }
 

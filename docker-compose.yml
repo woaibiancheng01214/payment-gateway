@@ -152,7 +152,7 @@ services:
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
       GATEWAY_SERVER_URL: http://external-payment-gateway:8081
-      GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/v1/webhooks/gateway
+      GATEWAY_CALLBACK_URL: http://checkout-lb:8080/v1/webhooks/gateway
       TOKEN_SERVICE_URL: http://token-service:8084
       VAULT_SERVICE_URL: http://card-vault-service:8086
       SPRING_PROFILES_ACTIVE: docker
@@ -160,7 +160,7 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1024M
+          memory: 512M
 
   # ── Non-PCI Zone: External-facing services ──────────────────────────────
 
@@ -184,7 +184,7 @@ services:
           cpus: "0.5"
           memory: 512M
 
-  acquirer-core-backend:
+  acquirer-core-1:
     build:
       context: ./acquirer-core-backend
       dockerfile: Dockerfile
@@ -201,14 +201,12 @@ services:
         condition: service_started
       merchant-service:
         condition: service_started
-    ports:
-      - "8080:8080"
-    environment:
+    environment: &checkout-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/acquirer_core
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
       GATEWAY_SERVER_URL: http://external-payment-gateway:8081
-      GATEWAY_CALLBACK_URL: http://acquirer-core-backend:8080/v1/webhooks/gateway
+      GATEWAY_CALLBACK_URL: http://checkout-lb:8080/v1/webhooks/gateway
       GATEWAY_WEBHOOK_SECRET: payment-gateway-webhook-secret-2026
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
@@ -222,6 +220,41 @@ services:
         limits:
           cpus: "1.0"
           memory: 1024M
+
+  acquirer-core-2:
+    build:
+      context: ./acquirer-core-backend
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      card-vault-service:
+        condition: service_started
+      token-service:
+        condition: service_started
+      card-auth-service:
+        condition: service_started
+      merchant-service:
+        condition: service_started
+    environment:
+      <<: *checkout-env
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+
+  checkout-lb:
+    image: nginx:alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/nginx-checkout.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - acquirer-core-1
+      - acquirer-core-2
 
   external-payment-gateway:
     build:
@@ -239,7 +272,7 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1024M
+          memory: 512M
 
   ledger-service:
     build:
@@ -262,14 +295,14 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 1024M
+          memory: 512M
 
   register-connector:
     image: curlimages/curl:latest
     depends_on:
       debezium:
         condition: service_healthy
-      acquirer-core-backend:
+      acquirer-core-1:
         condition: service_started
     restart: "no"
     entrypoint: >

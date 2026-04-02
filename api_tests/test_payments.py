@@ -184,14 +184,14 @@ def test_confirm_input_validation():
     intent_id = intent["id"]
 
     # Empty card number -> 400
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": "", "expiryMonth": 12, "expiryYear": 2030, "cvc": "123"},
                       timeout=5)
     assert r.status_code == 400, f"Expected 400 for empty cardNumber, got {r.status_code}"
     ok("Empty cardNumber correctly rejected")
 
     # expiryMonth = 0 -> 400
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 0,
                             "expiryYear": 2030, "cvc": "123"},
                       timeout=5)
@@ -199,7 +199,7 @@ def test_confirm_input_validation():
     ok("expiryMonth=0 correctly rejected")
 
     # expiryMonth = 13 -> should be 400 (requires @Max(12) annotation)
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 13,
                             "expiryYear": 2030, "cvc": "123"},
                       timeout=5)
@@ -209,7 +209,7 @@ def test_confirm_input_validation():
         warn(f"expiryMonth=13 returned {r.status_code} — missing @Max(12) validation on DTO")
 
     # expiryYear = 2024 -> 400
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
                             "expiryYear": 2024, "cvc": "123"},
                       timeout=5)
@@ -217,7 +217,7 @@ def test_confirm_input_validation():
     ok("expiryYear=2024 correctly rejected")
 
     # CVC too short (2 digits) -> 400
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
                             "expiryYear": 2030, "cvc": "12"},
                       timeout=5)
@@ -225,7 +225,7 @@ def test_confirm_input_validation():
     ok("CVC too short (2 digits) correctly rejected")
 
     # CVC too long (5 digits) -> 400
-    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/confirm",
+    r = requests.post(f"{BASE}/v1/payment_intents/{intent_id}/authorise",
                       json={"cardNumber": CARD_VISA["cardNumber"], "expiryMonth": 12,
                             "expiryYear": 2030, "cvc": "12345"},
                       timeout=5)

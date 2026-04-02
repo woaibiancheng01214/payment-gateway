@@ -45,29 +45,38 @@ class GatewayClient(
             .build()
     )
 
-    fun dispatch(internalAttempt: InternalAttempt) {
-        Bulkhead.decorateRunnable(bulkhead,
-            CircuitBreaker.decorateRunnable(circuitBreaker) {
-                when (internalAttempt.type) {
-                    InternalAttemptType.AUTH -> authorize(internalAttempt)
-                    InternalAttemptType.CAPTURE -> capture(internalAttempt)
-                }
+    /**
+     * Synchronous auth dispatch — returns the gateway's inline decision ("success" or "failure").
+     */
+    fun dispatchAuth(internalAttempt: InternalAttempt): String {
+        return Bulkhead.decorateSupplier(bulkhead,
+            CircuitBreaker.decorateSupplier(circuitBreaker) {
+                val payload = parsePayload(internalAttempt.requestPayload)
+                val body = mapOf(
+                    "internalAttemptId" to internalAttempt.id,
+                    "paymentToken" to (payload["paymentToken"] ?: ""),
+                    "cardBrand" to (payload["cardBrand"] ?: "unknown"),
+                    "amount" to (payload["amount"] ?: 0L),
+                    "currency" to (payload["currency"] ?: "USD"),
+                    "callbackUrl" to callbackUrl
+                )
+                val response = http.postForEntity("$gatewayUrl/v1/authorize", body, Map::class.java)
+                val status = response.body?.get("status")?.toString() ?: "failure"
+                log.info("AUTH dispatched to gateway for attempt ${internalAttempt.id} — result: $status")
+                status
             }
-        ).run()
+        ).get()
     }
 
-    private fun authorize(internalAttempt: InternalAttempt) {
-        val payload = parsePayload(internalAttempt.requestPayload)
-        val body = mapOf(
-            "internalAttemptId" to internalAttempt.id,
-            "paymentToken" to (payload["paymentToken"] ?: ""),
-            "cardBrand" to (payload["cardBrand"] ?: "unknown"),
-            "amount" to (payload["amount"] ?: 0L),
-            "currency" to (payload["currency"] ?: "USD"),
-            "callbackUrl" to callbackUrl
-        )
-        http.postForEntity("$gatewayUrl/v1/authorize", body, Map::class.java)
-        log.info("AUTH dispatched to gateway for attempt ${internalAttempt.id}")
+    /**
+     * Async capture dispatch — fire-and-forget, webhook callback later.
+     */
+    fun dispatchCapture(internalAttempt: InternalAttempt) {
+        Bulkhead.decorateRunnable(bulkhead,
+            CircuitBreaker.decorateRunnable(circuitBreaker) {
+                capture(internalAttempt)
+            }
+        ).run()
     }
 
     private fun capture(internalAttempt: InternalAttempt) {

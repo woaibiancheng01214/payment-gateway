@@ -1,6 +1,7 @@
 package com.payment.gateway.mock.controller
 
 import com.payment.gateway.mock.dto.AuthorizeRequest
+import com.payment.gateway.mock.dto.AuthorizeResponse
 import com.payment.gateway.mock.dto.CaptureRequest
 import com.payment.gateway.mock.dto.GatewayAckResponse
 import com.payment.gateway.mock.service.GatewayJobType
@@ -18,21 +19,20 @@ class GatewayController(
     @Value("\${gateway.ack.floor-ms:10}") private val ackFloorMs: Long,
     @Value("\${gateway.ack.cap-ms:5000}") private val ackCapMs: Long,
     @Value("\${gateway.ack.lambda:0.002}") private val ackLambda: Double,
+    @Value("\${gateway.sync-auth.floor-ms:50}") private val syncAuthFloorMs: Long,
+    @Value("\${gateway.sync-auth.cap-ms:300}") private val syncAuthCapMs: Long,
+    @Value("\${gateway.sync-auth.lambda:0.005}") private val syncAuthLambda: Double,
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
     @PostMapping("/authorize")
-    fun authorize(@RequestBody req: AuthorizeRequest): ResponseEntity<GatewayAckResponse> {
+    fun authorize(@RequestBody req: AuthorizeRequest): ResponseEntity<AuthorizeResponse> {
         log.info("Authorize received: attemptId=${req.internalAttemptId} token=${req.paymentToken} brand=${req.cardBrand} amount=${req.amount} ${req.currency}")
-        simulateAckLatency(req.internalAttemptId)
-        simulator.simulate(
-            type = GatewayJobType.AUTH,
-            internalAttemptId = req.internalAttemptId,
-            cardBrand = req.cardBrand,
-            callbackUrl = req.callbackUrl
-        )
-        return ResponseEntity.status(HttpStatus.ACCEPTED)
-            .body(GatewayAckResponse(gatewayRef = req.internalAttemptId))
+        simulateSyncAuthLatency(req.internalAttemptId)
+        val outcome = simulator.rollOutcome(GatewayJobType.AUTH)
+        val status = if (outcome == "timeout") "failure" else outcome
+        log.info("[${req.internalAttemptId}] sync auth result: $status")
+        return ResponseEntity.ok(AuthorizeResponse(gatewayRef = req.internalAttemptId, status = status))
     }
 
     @PostMapping("/capture")
@@ -51,13 +51,24 @@ class GatewayController(
 
     /**
      * Exponential ACK latency: floor 10ms, cap 5000ms.
-     * Simulates a real gateway that sometimes takes seconds to accept the request.
+     * Used for async endpoints (capture).
      */
     private fun simulateAckLatency(attemptId: String) {
         val u = Math.random()
         val sample = -Math.log(1.0 - u) / ackLambda
         val delayMs = (ackFloorMs + sample.toLong()).coerceAtMost(ackCapMs)
         if (delayMs > 1000) log.info("[$attemptId] simulating slow ACK: ${delayMs}ms")
+        Thread.sleep(delayMs)
+    }
+
+    /**
+     * Synchronous auth latency: floor 50ms, cap 300ms.
+     * Simulates a real gateway processing an auth decision inline.
+     */
+    private fun simulateSyncAuthLatency(attemptId: String) {
+        val u = Math.random()
+        val sample = -Math.log(1.0 - u) / syncAuthLambda
+        val delayMs = (syncAuthFloorMs + sample.toLong()).coerceAtMost(syncAuthCapMs)
         Thread.sleep(delayMs)
     }
 

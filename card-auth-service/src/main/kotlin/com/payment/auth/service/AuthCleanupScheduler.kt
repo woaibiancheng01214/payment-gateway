@@ -70,8 +70,20 @@ class AuthCleanupScheduler(
         var dispatched = 0
         for (ia in undispatched) {
             try {
-                gatewayClient.dispatch(ia)
-                authService.markDispatched(ia.id)
+                when (ia.type) {
+                    InternalAttemptType.AUTH -> {
+                        val result = gatewayClient.dispatchAuth(ia)
+                        authService.markDispatched(ia.id)
+                        val resolvedStatus = if (result == "success") InternalAttemptStatus.SUCCESS else InternalAttemptStatus.FAILURE
+                        ia.status = resolvedStatus
+                        ia.updatedAt = Instant.now()
+                        internalAttemptRepository.save(ia)
+                    }
+                    InternalAttemptType.CAPTURE -> {
+                        gatewayClient.dispatchCapture(ia)
+                        authService.markDispatched(ia.id)
+                    }
+                }
                 dispatched++
             } catch (e: Exception) {
                 log.error("Dispatch-retry failed for ${ia.id}: ${e.message}")

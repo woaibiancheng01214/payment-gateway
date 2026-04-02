@@ -4,7 +4,7 @@ import jakarta.validation.constraints.Min
 import jakarta.validation.constraints.NotBlank
 import java.time.Instant
 
-data class ConfirmRequest(
+data class AuthoriseRequest(
     @field:NotBlank(message = "Payment intent ID is required")
     val paymentIntentId: String,
 
@@ -21,7 +21,7 @@ data class ConfirmRequest(
     val currency: String
 )
 
-data class ConfirmResponse(val internalAttemptId: String)
+data class AuthoriseResponse(val internalAttemptId: String, val status: String = "pending")
 
 data class CaptureRequest(
     @field:NotBlank(message = "Payment attempt ID is required")
