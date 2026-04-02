@@ -1628,28 +1628,44 @@ stateless services) but scaling replicas only helps with additional physical res
 supports replicas (no shared state, correct locking) but the throughput numbers will be
 misleading. Use separate hosts/pods or dedicated CPU/memory allocations.
 
-## 60. Mock gateway with async webhooks creates artificial throughput ceilings
+## 60. Mock gateway must simulate how card networks actually work
 
 The mock gateway simulated both auth and capture as async-with-webhook: accept request,
 schedule delayed outcome (10-120s), fire webhook back. At 150+ TPS, the webhook backlog
 overwhelmed the gateway's thread pool — only 30% of intents reached terminal state.
 
-**The webhook round-trip was the bottleneck, not the business logic.** This didn't match
-real-world payment flows where auth is synchronous (gateway returns approve/decline inline)
-and capture is fire-and-forget (settlement is batched).
+**The webhook round-trip was the bottleneck, not the business logic.** More importantly,
+this didn't match how real card networks (Visa, Mastercard) actually operate:
 
-**Fix:** Made auth synchronous — gateway returns `{status: "success"}` inline with 50-300ms
-simulated latency. Made capture fire-and-forget — client gets `CAPTURED` immediately,
-settlement dispatch happens async. Renamed `confirm` → `authorise` to match payment
-terminology.
+- **Auth is synchronous in reality.** When you tap your card at a terminal, the POS sends
+  an ISO 8583 authorisation message through the acquirer → card network → issuer chain. The
+  issuer returns approve/decline inline within 1-3 seconds. There is no webhook — the
+  response travels back through the same connection. The entire auth flow is a synchronous
+  request-response over the card network. Our mock should reflect this: gateway returns
+  `{status: "success"|"failure"}` inline with 50-300ms simulated latency.
+
+- **Capture is fire-and-forget in reality.** Capture (settlement) is not a real-time
+  operation. Acquirers batch captures into settlement files and submit them to the card
+  network in daily clearing cycles. The merchant doesn't wait for settlement confirmation
+  — the POS shows "approved" at auth time, not at capture time. Our mock reflects this:
+  the client gets `CAPTURED` immediately, settlement dispatch happens async.
+
+- **Webhooks are for genuinely async events.** In real payment systems, webhooks/
+  notifications are used for events that happen outside the transaction flow: chargebacks
+  (45-120 days later), disputes, refund confirmations, 3DS authentication results. Not for
+  auth or capture.
+
+**Fix:** Made auth synchronous, capture fire-and-forget, renamed `confirm` → `authorise`.
 
 **Result:** Write throughput doubled from 100 TPS to 200 TPS. Gateway CPU dropped from 51%
 to 5%. The bottleneck shifted from "webhook round-trip" to "backend CPU" — the correct
 scaling target.
 
-**Takeaway:** Mock services should simulate real-world behavior, not just "something async."
-Sync vs async choices in mock gateways directly affect what bottlenecks you test. If your
-mock is harder than reality, you'll optimise for the wrong thing.
+**Takeaway:** Mock services must simulate real-world protocols, not just "something async."
+A mock that's harder than reality makes you optimise for artificial bottlenecks. Study how
+the actual protocol works (ISO 8583 for cards, SWIFT for bank transfers, etc.) and model
+your mock accordingly. The sync/async boundary in your mock determines what bottlenecks
+your load tests can find.
 
 ## 61. JVM services on 512MB Docker limits run at 55-65% memory usage regardless of workload
 
