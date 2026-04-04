@@ -1,6 +1,7 @@
 package com.payment.gateway.config
 
 import com.payment.gateway.dto.ApiError
+import com.payment.gateway.service.LockAlreadyHeldException
 import jakarta.persistence.LockTimeoutException
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
@@ -21,6 +22,16 @@ class GlobalExceptionHandler {
                 type = ApiError.TYPE_INVALID_REQUEST,
                 code = ApiError.CODE_INVALID_PARAM,
                 message = e.message ?: "Bad request"
+            )
+        )
+
+    @ExceptionHandler(LockAlreadyHeldException::class)
+    fun handleLockConflict(e: LockAlreadyHeldException): ResponseEntity<ApiError> =
+        ResponseEntity.status(HttpStatus.CONFLICT).body(
+            ApiError(
+                type = ApiError.TYPE_CONFLICT,
+                code = ApiError.CODE_STATE_CONFLICT,
+                message = e.message ?: "Lock conflict"
             )
         )
 

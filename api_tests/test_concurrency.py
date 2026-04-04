@@ -446,6 +446,257 @@ def test_duplicate_confirm_sequential():
 
 
 # =============================================================================
+#  6. Redis Down — Functional (advisory lock fallback)
+# =============================================================================
+
+def _docker_stop_redis():
+    import subprocess
+    info("Stopping Redis container...")
+    subprocess.run(
+        ["docker-compose", "stop", "redis"],
+        cwd="/Users/vincent.li/ClaudeCodeProjects/payment-gateway",
+        capture_output=True, timeout=30,
+    )
+    time.sleep(2)
+    info("Redis stopped")
+
+
+def _docker_start_redis():
+    import subprocess
+    info("Starting Redis container...")
+    subprocess.run(
+        ["docker-compose", "start", "redis"],
+        cwd="/Users/vincent.li/ClaudeCodeProjects/payment-gateway",
+        capture_output=True, timeout=30,
+    )
+    time.sleep(3)
+    info("Redis started")
+
+
+def test_redis_down_confirm():
+    """With Redis stopped, verify confirms still work via PG advisory lock fallback."""
+    print(f"\n{BOLD}{'='*60}{RESET}")
+    print(f"{BOLD}  TEST: Redis Down — Confirm Functional (advisory lock){RESET}")
+    print(f"{BOLD}{'='*60}{RESET}")
+
+    _docker_stop_redis()
+    try:
+        # --- Part 1: Create and confirm 5 intents serially ---
+        info("Part 1: Serial create + confirm (5 intents, Redis down)")
+        serial_ok = 0
+        for i in range(5):
+            try:
+                intent = create_intent()
+                r = confirm_intent(intent["id"])
+                if r.status_code == 200:
+                    serial_ok += 1
+                else:
+                    record_issue("CRITICAL", "redis_down_confirm",
+                                 f"Intent {i+1} confirm returned {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                record_issue("CRITICAL", "redis_down_confirm",
+                             f"Intent {i+1} failed with exception: {e}")
+
+        if serial_ok == 5:
+            ok(f"All 5 serial confirms succeeded without Redis")
+        else:
+            record_issue("CRITICAL", "redis_down_confirm",
+                         f"Only {serial_ok}/5 serial confirms succeeded")
+
+        # --- Part 2: Concurrent confirms on a single intent ---
+        info("Part 2: 20 concurrent confirms on 1 intent (Redis down)")
+        intent = create_intent()
+        intent_id = intent["id"]
+        info(f"Created intent {intent_id}")
+
+        results = []
+        lock = threading.Lock()
+
+        def _confirm():
+            try:
+                r = confirm_intent(intent_id)
+                with lock:
+                    results.append(r)
+            except Exception as e:
+                with lock:
+                    results.append(e)
+
+        threads = [threading.Thread(target=_confirm) for _ in range(20)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        elapsed = time.time() - t0
+        info(f"20 concurrent confirms finished in {elapsed:.1f}s")
+
+        status_counts = Counter()
+        for r in results:
+            if isinstance(r, Exception):
+                status_counts["exception"] += 1
+            else:
+                status_counts[r.status_code] += 1
+        info(f"Status distribution: {dict(status_counts)}")
+
+        count_200 = status_counts.get(200, 0)
+        count_409 = status_counts.get(409, 0)
+        count_503 = status_counts.get(503, 0)
+
+        if count_200 == 1:
+            ok("Exactly 1 confirm succeeded (200)")
+        elif count_200 == 0:
+            record_issue("CRITICAL", "redis_down_confirm", "No confirm succeeded (0 x 200)")
+        else:
+            record_issue("WARNING", "redis_down_confirm",
+                         f"{count_200} confirms returned 200 (expected 1)")
+
+        info(f"409 Conflict: {count_409}, 503 Bulkhead rejected: {count_503}")
+
+        count_5xx = sum(v for k, v in status_counts.items() if isinstance(k, int) and k >= 500 and k != 503)
+        if count_5xx > 0:
+            record_issue("CRITICAL", "redis_down_confirm", f"{count_5xx} unexpected 5xx errors")
+        else:
+            ok("No unexpected 5xx errors")
+
+        time.sleep(3)
+        detail = get_intent(intent_id)
+        attempts = detail.get("attempts", [])
+        info(f"Intent status: {detail['status']}, PaymentAttempts: {len(attempts)}")
+
+        if len(attempts) == 1:
+            ok("Exactly 1 PaymentAttempt created (advisory lock enforced)")
+        elif len(attempts) == 0:
+            record_issue("WARNING", "redis_down_confirm", "No PaymentAttempt created")
+        else:
+            record_issue("CRITICAL", "redis_down_confirm",
+                         f"{len(attempts)} PaymentAttempts created (expected 1 — advisory lock not enforced)")
+    finally:
+        _docker_start_redis()
+
+
+# =============================================================================
+#  7. Redis Down — Load Test (advisory lock + bulkhead under pressure)
+# =============================================================================
+
+def test_redis_down_load():
+    """Load test: many concurrent confirms across multiple intents with Redis down.
+    Tests how the 5-connection bulkhead handles real traffic."""
+    print(f"\n{BOLD}{'='*60}{RESET}")
+    print(f"{BOLD}  TEST: Redis Down — Load Test (10 intents, 50 confirms){RESET}")
+    print(f"{BOLD}{'='*60}{RESET}")
+
+    NUM_INTENTS = 10
+    CONFIRMS_PER_INTENT = 5
+
+    # Create intents while Redis is up
+    info(f"Creating {NUM_INTENTS} intents (Redis up)...")
+    intent_ids = []
+    for _ in range(NUM_INTENTS):
+        intent = create_intent()
+        intent_ids.append(intent["id"])
+    ok(f"Created {len(intent_ids)} intents")
+
+    _docker_stop_redis()
+    try:
+        results = []
+        lock = threading.Lock()
+
+        def _confirm(iid):
+            t0 = time.time()
+            try:
+                r = confirm_intent(iid)
+                elapsed_ms = (time.time() - t0) * 1000
+                with lock:
+                    results.append((iid, r.status_code, elapsed_ms, r))
+            except Exception as e:
+                elapsed_ms = (time.time() - t0) * 1000
+                with lock:
+                    results.append((iid, -1, elapsed_ms, e))
+
+        threads = []
+        for iid in intent_ids:
+            for _ in range(CONFIRMS_PER_INTENT):
+                threads.append(threading.Thread(target=_confirm, args=(iid,)))
+
+        info(f"Firing {len(threads)} concurrent confirms ({CONFIRMS_PER_INTENT} per intent, Redis down)...")
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        total_elapsed = time.time() - t0
+        info(f"{len(threads)} concurrent confirms finished in {total_elapsed:.1f}s")
+
+        # Classify results
+        status_counts = Counter()
+        latencies_by_status = {}
+        per_intent_200 = Counter()
+
+        for iid, status_code, elapsed_ms, resp in results:
+            status_counts[status_code] += 1
+            latencies_by_status.setdefault(status_code, []).append(elapsed_ms)
+            if status_code == 200:
+                per_intent_200[iid] += 1
+
+        info(f"Status distribution: {dict(status_counts)}")
+
+        count_200 = status_counts.get(200, 0)
+        count_409 = status_counts.get(409, 0)
+        count_503 = status_counts.get(503, 0)
+        count_5xx_other = sum(v for k, v in status_counts.items() if isinstance(k, int) and k >= 500 and k != 503)
+        count_exc = status_counts.get(-1, 0)
+
+        info(f"200 OK: {count_200}  |  409 Conflict: {count_409}  |  503 Bulkhead: {count_503}  |  Other 5xx: {count_5xx_other}  |  Exceptions: {count_exc}")
+
+        # Each intent should have at most 1 successful confirm
+        multi_success = {iid: cnt for iid, cnt in per_intent_200.items() if cnt > 1}
+        if not multi_success:
+            ok(f"Each intent had at most 1 successful confirm ({count_200} total across {NUM_INTENTS} intents)")
+        else:
+            record_issue("CRITICAL", "redis_down_load",
+                         f"{len(multi_success)} intents had multiple 200s: {multi_success}")
+
+        if count_5xx_other > 0:
+            record_issue("CRITICAL", "redis_down_load", f"{count_5xx_other} unexpected 5xx errors")
+        else:
+            ok("No unexpected 5xx errors")
+
+        if count_503 > 0:
+            info(f"Bulkhead rejected {count_503} requests (expected under load with max 5 concurrent advisory locks)")
+
+        # Latency percentiles
+        all_latencies = []
+        for lats in latencies_by_status.values():
+            all_latencies.extend(lats)
+        percentiles(all_latencies, "Overall latency")
+
+        if 200 in latencies_by_status:
+            percentiles(latencies_by_status[200], "200 OK latency")
+        if 409 in latencies_by_status:
+            percentiles(latencies_by_status[409], "409 Conflict latency")
+        if 503 in latencies_by_status:
+            percentiles(latencies_by_status[503], "503 Bulkhead latency")
+
+        # Verify intent state: each should have exactly 1 PaymentAttempt
+        time.sleep(5)
+        info("Verifying intent state...")
+        intents_with_wrong_count = 0
+        for iid in intent_ids:
+            detail = get_intent(iid)
+            attempt_count = len(detail.get("attempts", []))
+            if attempt_count > 1:
+                intents_with_wrong_count += 1
+                record_issue("CRITICAL", "redis_down_load",
+                             f"Intent {iid} has {attempt_count} PaymentAttempts (expected <=1)")
+
+        if intents_with_wrong_count == 0:
+            ok(f"All {NUM_INTENTS} intents have at most 1 PaymentAttempt (advisory lock enforced)")
+
+    finally:
+        _docker_start_redis()
+
+
+# =============================================================================
 #  Run all
 # =============================================================================
 

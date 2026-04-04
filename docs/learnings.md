@@ -1685,3 +1685,43 @@ PostgreSQL cache hit ratio was 100% (zero disk reads) — the database was not t
 any Spring Boot service. The "80% memory" metric is misleading — the JVM pre-allocates
 structures that appear as usage but aren't growing. Monitor heap used vs heap max separately
 from total container memory.
+
+## 62. DB fallback must provide per-intent locking, not just concurrency limiting
+
+The Resilience4j bulkhead in `DistributedLockManager` gated the Redis-down fallback path
+at 5 concurrent requests, but the bulkhead was **global** — it had no per-intent mutual
+exclusion. Two concurrent confirms for the same intent both passed the bulkhead and
+proceeded to tokenize cards (expensive PCI service calls) before `findByIdForUpdate()`
+finally serialized them inside the DB transaction. The `@Suppress("UNUSED_PARAMETER")` on
+`intentId` was the code smell.
+
+**Fix:** Replaced the no-op fallback with `pg_try_advisory_lock(hashtext('lock:intent:' || intentId))`.
+Advisory locks are session-scoped (tied to the JDBC connection, not the transaction), so the
+raw connection is borrowed from HikariCP, held inside the `LockResult` object for the
+duration of the confirm flow, and returned to the pool when `releaseLock()` calls `close()`.
+The bulkhead stays as an outer gate to cap how many connections are held simultaneously.
+
+Also fixed a control flow bug: `acquireLock()` used `IllegalStateException` as a signal for
+"lock already held", but any `IllegalStateException` from Spring/Resilience4j internals would
+be misinterpreted. Replaced with a dedicated `LockAlreadyHeldException`.
+
+Additionally added `spring.data.redis.timeout=2000` and `spring.data.redis.connect-timeout=2000`
+to make Redis failures fail fast (2 seconds) instead of waiting for the default Lettuce timeout
+(~60 seconds), which was causing request timeouts before the circuit breaker could open.
+
+**Key design choice:** Session-level `pg_advisory_lock` (not transaction-level `pg_advisory_xact_lock`)
+because the lock must span tokenization (external HTTP calls outside any transaction) plus the DB
+transaction. EntityManager/JdbcTemplate cannot be used because they return connections to the pool
+after each call, which would lose the session-scoped advisory lock. The connection reference lives
+in `LockResult` and its lifetime is naturally scoped to the caller's `try/finally` block.
+
+**Test results (Redis down, 50 concurrent confirms across 10 intents):**
+- 10 succeeded (1 per intent), 40 rejected (409 Conflict)
+- 0 bulkhead rejections, 0 unexpected 5xx errors
+- P50 latency: 39ms overall, 29ms for 409 rejections
+- All 10 intents had exactly 1 PaymentAttempt
+
+**Takeaway:** A concurrency limiter (bulkhead) is not a lock. If you need per-resource
+mutual exclusion when the primary lock (Redis) is unavailable, you need a real per-resource
+fallback lock. PostgreSQL advisory locks are the built-in answer — they provide distributed
+locking across all application instances without any additional infrastructure.

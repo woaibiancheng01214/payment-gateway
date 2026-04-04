@@ -7,16 +7,25 @@ import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import org.slf4j.LoggerFactory
 import org.springframework.data.redis.core.StringRedisTemplate
 import org.springframework.stereotype.Service
+import java.sql.Connection
 import java.time.Duration
 import java.util.UUID
+import javax.sql.DataSource
+
+class LockAlreadyHeldException(message: String) : RuntimeException(message)
 
 enum class LockSource { REDIS, DB_FALLBACK }
 
-data class LockResult(val lockValue: String?, val acquiredVia: LockSource)
+class LockResult(
+    val lockValue: String?,
+    val acquiredVia: LockSource,
+    internal val advisoryConnection: Connection? = null
+)
 
 @Service
 class DistributedLockManager(
-    private val redisTemplate: StringRedisTemplate
+    private val redisTemplate: StringRedisTemplate,
+    private val dataSource: DataSource
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
@@ -48,7 +57,6 @@ class DistributedLockManager(
     )
 
     fun acquireLock(intentId: String): LockResult {
-        // Try Redis first via circuit breaker
         try {
             val result = CircuitBreaker.decorateSupplier(circuitBreaker) {
                 acquireRedisLock(intentId)
@@ -57,31 +65,57 @@ class DistributedLockManager(
             if (result != null) {
                 return LockResult(result, LockSource.REDIS)
             }
-            // Lock is held by another request
-            throw IllegalStateException("Another operation is already in progress for PaymentIntent $intentId")
-        } catch (e: IllegalStateException) {
-            throw e // re-throw state conflicts (lock already held)
+            throw LockAlreadyHeldException("Another operation is already in progress for PaymentIntent $intentId")
+        } catch (e: LockAlreadyHeldException) {
+            throw e
         } catch (e: Exception) {
-            // Redis failed or circuit breaker is open — fall back to DB-only locking
-            log.warn("Redis lock unavailable (circuit breaker state: ${circuitBreaker.state}), falling back to DB lock: ${e.message}")
+            log.warn("Redis lock unavailable (circuit breaker state: ${circuitBreaker.state}), falling back to DB advisory lock: ${e.message}")
             return acquireWithBulkhead(intentId)
         }
     }
 
     fun releaseLock(intentId: String, lockResult: LockResult) {
-        if (lockResult.acquiredVia == LockSource.REDIS && lockResult.lockValue != null) {
-            releaseRedisLock(intentId, lockResult.lockValue)
+        when (lockResult.acquiredVia) {
+            LockSource.REDIS -> {
+                if (lockResult.lockValue != null) releaseRedisLock(intentId, lockResult.lockValue)
+            }
+            LockSource.DB_FALLBACK -> {
+                try {
+                    lockResult.advisoryConnection?.close()
+                } catch (e: Exception) {
+                    log.warn("Advisory lock connection close failed for intent $intentId: ${e.message}")
+                }
+            }
         }
     }
 
-    @Suppress("UNUSED_PARAMETER")
     private fun acquireWithBulkhead(intentId: String): LockResult {
         try {
             return Bulkhead.decorateSupplier(bulkhead) {
-                LockResult(null, LockSource.DB_FALLBACK)
+                acquireAdvisoryLock(intentId)
             }.get()
+        } catch (e: LockAlreadyHeldException) {
+            throw e
         } catch (e: Exception) {
             throw IllegalStateException("Service temporarily unavailable — too many concurrent DB fallback requests")
+        }
+    }
+
+    private fun acquireAdvisoryLock(intentId: String): LockResult {
+        val conn = dataSource.connection
+        var success = false
+        try {
+            val acquired = conn.prepareStatement("SELECT pg_try_advisory_lock(hashtext(?))").use { stmt ->
+                stmt.setString(1, LOCK_PREFIX + intentId)
+                stmt.executeQuery().use { rs -> rs.next(); rs.getBoolean(1) }
+            }
+            if (!acquired) {
+                throw LockAlreadyHeldException("Another operation is already in progress for PaymentIntent $intentId")
+            }
+            success = true
+            return LockResult(null, LockSource.DB_FALLBACK, advisoryConnection = conn)
+        } finally {
+            if (!success) conn.close()
         }
     }
 
@@ -93,7 +127,7 @@ class DistributedLockManager(
                 redisGetIdemInternal(key, requestHash)
             }.get()
         } catch (e: IllegalArgumentException) {
-            throw e // hash mismatch — real error, propagate
+            throw e
         } catch (e: Exception) {
             log.warn("Redis idem GET failed (circuit breaker), falling through to DB: ${e.message}")
             null
